@@ -13,7 +13,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ### **Introduction**
 
-Ce document vise à présenter notre démarche analytique dans le cadre du Data Challenge ENS sur l'assurance des bâtiments. L'objectif est de prédire la probabilité qu'un bâtiment soit sujet à un sinistre durant une période donnée, en se basant sur ses caractéristiques. À travers ce challenge, nous aborderons la modélisation de la fréquence des sinistres, essentielle dans le processus de tarification en assurance non-vie.
+Ce document vise à présenter la démarche analytique dans le cadre du Data Challenge ENS sur l'assurance des bâtiments. L'objectif est de prédire la probabilité qu'un bâtiment soit sujet à un sinistre durant une période donnée, en se basant sur ses caractéristiques. À travers ce challenge, nous aborderons la modélisation de la fréquence des sinistres, essentielle dans le processus de tarification en assurance non-vie.
 
 ### Contexte
 
