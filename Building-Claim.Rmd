@@ -1,0 +1,1844 @@
+---
+title: "Building Claim Prediction"
+author: "Ulysse TRIN"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    extra_dependencies: ["webshot2"]
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### **Introduction**
+
+Ce document vise à présenter notre démarche analytique dans le cadre du Data Challenge ENS sur l'assurance des bâtiments. L'objectif est de prédire la probabilité qu'un bâtiment soit sujet à un sinistre durant une période donnée, en se basant sur ses caractéristiques. À travers ce challenge, nous aborderons la modélisation de la fréquence des sinistres, essentielle dans le processus de tarification en assurance non-vie.
+
+### Contexte
+
+L'assurance bâtiment couvre les dommages susceptibles d'affecter la structure d'un logement (murs, toit, sols, et zones communes) causés par des événements comme les inondations, les tempêtes, les incendies ou le vandalisme.
+
+Le défi proposé s'inscrit dans le processus de tarification de l'assurance non-vie, qui se décompose généralement en deux étapes :
+
+-   **Modélisation de la fréquence** : détermination du nombre attendu de sinistres qu'un assureur recevra pendant une période donnée.
+-   **Modélisation de la sévérité** : prédiction du coût moyen d'un sinistre.
+
+Cependant, l'objectif de ce challenge est spécifique : il s'agit de prédire si un bâtiment déposera une réclamation d'assurance durant une période assurée, basé sur les caractéristiques du bâtiment. La variable cible est donc :
+
+-   1 si le bâtiment a au moins un sinistre pendant la période assurée.
+-   0 si le bâtiment n'a pas de sinistre pendant la période assurée.
+
+### Description des données
+
+Les données en entrée contiennent les variables suivantes :
+
+-   **Identifiant** : variable permettant d'identifier le client dans la base de données de l'assureur. Variable d'identification.
+-   **EXPO** : temps assuré chez Generali sur l'année. Variable numérique.
+-   **superficief** : taille en m^2^ du bâtiment assuré. Variable numérique.
+-   **Insee** : code géographique français pour localiser le bâtiment assuré. Variable géographique/catégorielle très utile pour ajouter des données externes.
+-   **target** : variable cible (0 : pas de réclamation, 1 : au moins une réclamation sur la période assurée).
+-   **Autres ft_i_categ** : caractéristiques anonymisées du bâtiment. Variables catégorielles.
+
+### Benchmark initial
+
+Un benchmark rapide avec un modèle xgboost a été réalisé, atteignant un score NGC de 0.41. Il s'agit d'un modèle basique où toutes les variables catégorielles sont codées par étiquette. Les variables les plus importantes identifiées sont `superficief`, `ft_22_categ`, `EXPO`.
+
+### Métrique
+
+La métrique utilisée pour ce challenge est le coefficient de Gini normalisé. L'objectif est de construire un modèle qui prédit l'ordre des sinistres. Un modèle est performant s'il détecte avec une plus grande probabilité les bâtiments ayant effectivement eu un sinistre.
+
+### Plan
+
+Notre approche se déclinera en plusieurs étapes clés :
+
+1.  **Exploration et traitement des données** : Comprendre la distribution, la qualité, et les relations potentielles entre les variables.
+2.  **Modélisation** : Développement et entraînement de modèles prédictifs, en explorant différentes techniques et en optimisant leurs hyperparamètres.
+- Arbre de classification
+- XGBoost
+- LGMBoost 
+3.  **Évaluation et Sélection des Modèles** : Comparaison des modèles basée sur la métrique du coefficient de Gini normalisé et sélection du meilleur modèle.
+4.  **Conclusion**
+
+Ce document détaillera chaque étape de notre démarche, justifiera nos choix méthodologiques et interprétera les résultats obtenus afin de fournir une compréhension approfondie du phénomène étudié.
+
+### **1. Exploration et traitement des données**
+
+Pour commencer, nous vérifions si les packages nécessaires sont installés, et nous les installons s'ils ne le sont pas.
+
+```{r checkpackages, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+if (!require("xgboost")) install.packages("xgboost")
+if (!require("caret")) install.packages("caret")
+if (!require("Metrics")) install.packages("Metrics")
+if (!require("readr")) install.packages("readr")
+if (!require("downloader")) install.packages("downloader")
+if (!require("readxl")) install.packages("readxl")
+if (!require("pROC")) install.packages("pROC")
+if (!require("corrplot")) install.packages("corrplot")
+if (!require("rsample")) install.packages("rsample")
+if (!require("rpart")) install.packages("rpart")
+if (!require("rpart.plot")) install.packages("rpart.plot")
+if (!require("DiagrammeR")) install.packages("DiagrammeR")
+if (!require("lightgbm")) install.packages("lightgbm")
+if (!requireNamespace("webshot2", quietly = TRUE))
+    install.packages("webshot2")
+```
+
+```{r chargementpackages, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+library(readxl)
+library(dplyr)
+library(xgboost)
+library(caret)
+library(Metrics)
+library(readr)
+library(pROC)
+library(grid)
+library(corrplot)
+library(rsample)
+library(rpart)
+library(rpart.plot)
+library(lightgbm)
+library(ggplot2)
+library(readxl)
+```
+
+#### *Importation des données : test (X_test), entraînement (X_train), cible (Y_train)*
+
+Lors de l'importation de X_test et X_train, nous procédons à la suppression de la première colonne. Cette colonne, souvent générée automatiquement lors de l'exportation des données depuis certaines applications ou bases de données, sert d'index. Cependant, dans le contexte de notre analyse, cette colonne d'index n'est pas nécessaire et peut même interférer avec notre traitement des données.
+
+```{r importationtest, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+X_test <- read_csv("X_test.csv") %>% select(-`...1`)
+```
+
+```{r importationtrain, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+X_train <- read_csv("X_train.csv") %>% select(-`...1`)
+```
+
+```{r importationytrain, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+Y_train <- read_csv("y_train_saegPGl.csv")
+```
+
+#### Exploration de la variable cible Y_train
+
+```{r ytrain, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+# Comptage du nombre d'observations par classe
+table_distribution <- table(Y_train$target)
+
+# Impression du tableau de distribution
+print(table_distribution)
+```
+
+La classe "0" apparaît 7907 fois et la classe "1" 2322 fois.
+
+```{r analyseytrain, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+# Proportion de 1 et de 0
+prop.table(table(Y_train$target)) * 100
+```
+
+77.3% des données sont de la classe 0 et 22.7% de la classe 1, illustrant un déséquilibre où la majorité des observations appartient à la classe 0.
+
+
+
+```{r visuytrain, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE, ,fig.align='center' }
+# Création d'un dataframe pour la visualisation
+df_distribution <- data.frame(Target = names(table_distribution),
+                              Count = as.integer(table_distribution))
+
+# Graphique de la distribution de la variable cible
+ggplot(data = df_distribution, aes(x = Target, y = Count, fill = Target)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Distribution de la variable cible",
+       x = "Classe de sinistre",
+       y = "Nombre d'observations") +
+  scale_fill_manual(values = c("0" = "lightgreen", "1" = "lightcoral"))
+```
+
+L'exploration de la variable cible Y_train met en évidence une distribution asymétrique entre les classes, ce qui soulève des considérations importantes pour la modélisation. Avec 7 907 observations appartenant à la classe 0 (pas de sinistre) et 2 322 à la classe 1 (au moins un sinistre), nous observons une répartition de 77.3% pour la classe 0 et de 22.7% pour la classe 1.
+
+Cette distribution indique un déséquilibre significatif, où la majorité des observations ne signalent aucun sinistre. Cet état de fait peut engendrer des biais dans les modèles prédictifs, qui pourraient être enclins à favoriser la prédiction de la classe majoritaire. Cette prédominance pourrait diminuer la sensibilité du modèle aux cas réels de sinistres, affectant ainsi négativement la performance du modèle sur des données moins fréquentes mais critiques.
+
+
+
+
+#### *Importation de données de correspondance entre le code INSEE et le code postale*
+
+Nous importons les données de correspondance entre le code INSEE et le code postal afin de maximiser les possibilités d'enrichissement de notre modèle avec des données externes.
+
+```{r importationcorrespondance, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+# URL vers le fichier CSV contenant les données de correspondance entre le code INSEE et le code postal
+url_csv <- "https://www.data.gouv.fr/fr/datasets/r/edcfd5d7-5c97-4e86-8d27-e21c7e30a721"
+
+# Chargement du fichier CSV
+correspondance_df <- read_csv2(url_csv, locale = locale(encoding = "ISO-8859-1")) %>%
+  rename(Insee = `#Code_commune_INSEE`) %>% # renommer la colonne #Code_commune_INSEE en Insee pour simplifier l'accès à cette colonne
+  distinct(Insee, .keep_all = TRUE) %>% # Supprimer les doublons :
+  select(-Ligne_5) # sélectionner et supprimer la colonne Ligne 5
+```
+
+#### Enrichissement des données X_train et X_test avec les données de correspondance
+
+Nous enrichissons les données d'entraînement (X_train) et de test (X_test) avec les données de correspondance en utilisant le code INSEE comme clé de jointure.
+
+```{r enrichissementcorrespondance, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+# Enrichissement de X_train avec les données de correspondance
+X_train_enriched <- left_join(X_train, correspondance_df, by = "Insee")
+
+# Enrichissement de X_test avec les données de correspondance
+X_test_enriched <- left_join(X_test, correspondance_df, by = "Insee")
+```
+
+Vérification de l'enrichissement de X_test : 
+```{r nameXtest, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+names(X_test_enriched)
+```
+
+Vérification de l'enrichissement de X_train :
+```{r nameXtrain, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+names(X_train_enriched)
+```
+
+#### Intégration du numéro départemental
+
+Nous ajoutons une nouvelle colonne intitulée "Numéro_Départements" créer à partir des deux premiers chiffres des codes postaux dans les ensembles de données X_train_enriched et X_test_enriched.
+
+```{r ajoutdépartement, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+X_train_enriched$Numéro_Départements <- substr(X_train_enriched$Code_postal, 1, 2)
+X_test_enriched$Numéro_Départements <- substr(X_test_enriched$Code_postal, 1, 2)
+```
+
+
+#### *Importation de données sur le nom des départements et des régions*
+
+```{r importationdép, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+departements_df <- read_delim("https://www.data.gouv.fr/fr/datasets/r/987227fb-dcb2-429e-96af-8979f97c9c84", delim = ",", 
+                              col_names = c("Numéro_Départements", "Nom_département", "Nom_région"))
+
+# Supprimer la première ligne
+departements_df <- departements_df[-1, ] # supprime la première ligne
+```
+
+#### Enrichissement des données X_train et X_test avec le nom des départements et des régions
+Nous enrichissons les ensembles de données X_train_enriched et X_test_enriched en ajoutant des informations sur les noms des départements et des régions.
+
+```{r enrichissementdép, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+# Enrichissement de X_train_enriched avec les données supplémentaires en utilisant le "Numéro_Départements" comme clé de jointure
+X_train_enriched <- left_join(X_train_enriched, departements_df, by = "Numéro_Départements")
+
+# Enrichissement de X_test_enriched avec les données supplémentaires en utilisant le "Numéro_Départements" comme clé de jointure
+X_test_enriched <- left_join(X_test_enriched, departements_df, by = "Numéro_Départements")
+
+# Combinaison de X_train_enriched avec Y_train en utilisant l'identifiant comme clé de jointure
+combined_data <- left_join(X_train_enriched, Y_train, by = "Identifiant")
+
+# Supprimer les lignes avec des valeurs NA dans la colonne 'Nom_région'
+combined_data <- combined_data[!is.na(combined_data$Nom_région), ]
+```
+
+Vérification de l'enrichissement de X_test_enriched : 
+```{r nameXtestenri, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+names(X_test_enriched)
+```
+
+Vérification de l'enrichissement de X_train_enriched :
+```{r nameXtrainebri, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE }
+names(X_train_enriched)
+```
+
+```{r sinistreparrégion, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE, fig.align='center'}
+# Créer un dataframe pour les données agrégées par région et Target
+data_aggregated <- combined_data %>%
+  group_by(Nom_région, target) %>%
+  summarise(Count = n()) %>%
+  ungroup()
+
+# Tracer le graphique
+ggplot(data_aggregated, aes(x = Nom_région, y = Count, fill = as.factor(target))) +
+  geom_bar(stat = "identity", position = "stack") + # Utilisation de position = "stack"
+  labs(title = "Répartition de la variable cible par région",
+       x = "Région",
+       y = "Nombre d'observations",
+       fill = "Target") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c("0" = "lightgreen", "1" = "lightcoral")) # Couleur bleue pour Target = 0 et rouge pour Target = 1
+```
+
+
+
+
+Nous faisons l'hypothèse que la variable ft_22_categ représente l'année de construction du bâtiment. Cette supposition est basée sur des observations préliminaires des données et pourrait avoir des implications importantes pour notre modèle, étant donné que l'âge d'un bâtiment peut influencer sa susceptibilité à subir des sinistres.
+
+```{r année, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE, fig.align='center'}
+# Convertir 'ft_22_categ' en type numérique (integer) pour permettre les comparaisons.
+combined_data$ft_22_categ <- as.integer(as.character(combined_data$ft_22_categ))
+
+# Filtrer les données pour ne conserver que les sinistres avec target=1 et exclure les valeurs NA de 'ft_22_categ'
+sinistres_target_1 <- combined_data %>%
+  filter(target == 1, !is.na(ft_22_categ))
+
+# Créer une nouvelle colonne pour les années groupées
+sinistres_target_1 <- sinistres_target_1 %>%
+  mutate(annee = ifelse(ft_22_categ < 1900, "< 1900", 
+                              paste0(substr(as.character(ft_22_categ), 1, 3), "0")))
+
+# Calculer le nombre total de polices par groupe d'année
+total_polices_par_annee <- combined_data %>%
+  mutate(annee = ifelse(ft_22_categ < 1900, "< 1900",
+                              paste0(substr(as.character(ft_22_categ), 1, 3), "0"))) %>%
+  group_by(annee) %>%
+  summarise(Total = n())
+
+# Calculer le nombre de sinistres par groupe d'année
+sinistres_par_annee <- sinistres_target_1 %>%
+  group_by(annee) %>%
+  summarise(Sinistres = n())
+
+# Fusionner les données pour obtenir le taux de sinistres
+data_taux_sinistres <- merge(sinistres_par_annee, total_polices_par_annee, by = "annee")
+data_taux_sinistres$TauxSinistres <- data_taux_sinistres$Sinistres / data_taux_sinistres$Total
+
+# Tracer le graphique des taux de sinistres par année de construction
+ggplot(data_taux_sinistres, aes(x = annee, y = TauxSinistres, fill = annee)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Taux de sinistres par année de construction",
+       x = "Année de construction",
+       y = "Taux de sinistres") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+On observe que les bâtiments construits dans les années 1910 et 1970 ont le plus grand nombre de sinistres, avec des pics particulièrement élevés comparés aux autres périodes. En revanche, les bâtiments construits avant 1900 et après 2000 montrent nettement moins de sinistres.
+
+Cela peut suggérer plusieurs interprétations:
+
+- Les matériaux de construction ou les standards de construction pendant les années 1970 et 1980 pourraient ne pas être aussi résistants ou sécuritaires comparativement à d'autres périodes, menant à une plus grande incidence de sinistres.
+- Les bâtiments construits pendant cette période pourraient maintenant être à un âge où les problèmes commencent à se manifester davantage, par rapport aux constructions plus récentes ou beaucoup plus anciennes qui ont peut-être été mieux maintenues ou rénovées.
+- Des facteurs externes pourraient avoir influencé la fréquence des sinistres pour ces années de construction, comme des changements dans les réglementations, des pratiques de construction spécifiques à cette époque, ou des événements naturels qui ont eu un impact sur les bâtiments de cet âge.
+
+
+
+### *Importation de données sur les catastophes naturelles (CATNAT)*
+L'ajout de données sur les catastrophes naturelles peut s'avérer particulièrement pertinent. Ces données peuvent enrichir notre modèle prédictif en fournissant des informations contextuelles qui ne sont pas directement liées aux caractéristiques physiques des bâtiments, mais plutôt à leur environnement et aux événements historiques.
+
+#### Données sur les innondations
+Nous intégrons donc des données concernant les inondations, un type de catastrophe naturelle significative en termes de fréquence et de gravité des sinistres. L'indicateur que nous utilisons est le nombre de reconnaissances de l'état de catastrophe naturelle pour les inondations publiées au Journal Officiel. Cela inclut les inondations au sens large, qui peuvent être dues à des événements comme des débordements de cours d'eau, des coulées de boue, des remontées de nappe phréatique, ou des submersions marines.
+
+```{r innondations, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+
+# URL vers le fichier ZIP contenant les données CATNAT sur les inondations 
+url_zip <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbReco_Inondation.zip"
+
+# Création d'un fichier temporaire avec l'extension .zip pour stocker les données téléchargées
+destfile_zip <- tempfile(fileext = ".zip")
+
+# Téléchargement du fichier ZIP à partir de l'URL spécifiée et stockage dans le fichier temporaire créé
+download.file(url_zip, destfile_zip)
+
+# Décompression du fichier ZIP téléchargé dans le répertoire temporaire
+# exdir = tempdir() spécifie le répertoire dans lequel extraire les fichiers ZIP
+unzip(destfile_zip, exdir = tempdir())
+
+# Chemin d'accès vers le fichier Excel extrait dans le répertoire temporaire
+path_excel <- file.path(tempdir(), "ONRN_nbRecos_Inon_8222.xlsx")
+
+# Lecture du fichier Excel et sélection de la deuxième feuille de calcul (sheet = 2)
+# Renommage de la colonne "Code INSEE" en "Insee" pour plus de clarté
+# Remplacement des valeurs "Pas de reconnaissance" par "0"
+# Conversion de la colonne en format numérique
+nombre_inondations <- read_excel(path_excel, sheet = 2) %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` = 
+           if_else(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` == "Pas de reconnaissance", 
+                   "0", 
+                   `Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`)) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`))
+
+# Enrichissement de X_train et X_test avec les données CATNAT sur le nombre d'innondations
+# en utilisant le code INSEE comme clé de jointure
+X_train_enriched <- left_join(X_train_enriched, nombre_inondations, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_inondations, by = "Insee")
+```
+
+Vérification
+
+Nous procédons à cette vérification pour nous assurer que lors de l'enrichissement des données d'entraînement avec les informations sur les inondations, chaque observation du jeu de données original a été préservée. Si le nombre de lignes reste identique entre le jeu de données original et celui enrichi après la jointure, cela indique que tous les enregistrements ont été maintenus et qu'il n'y a pas eu de perte de données. Cela validerait que l'opération de jointure a correctement associé les données supplémentaires à chaque entrée existante sans exclure ni dupliquer des lignes. Si le test renvoie "TRUE", cela confirmerait que la correspondance entre les deux jeux de données est exacte.
+
+```{r innondationsverif, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# Vérification si le nombre de lignes dans le jeu de données original (X_train) est égal
+# au nombre de lignes dans le jeu de données enrichi (X_train_enriched)
+all.equal(nrow(X_train), nrow(X_train_enriched)) # devrait renvoyer TRUE
+
+# Vérification si le nombre de lignes dans le jeu de données original (X_test) est égal
+# au nombre de lignes dans le jeu de données enrichi (X_test_enriched)
+all.equal(nrow(X_test), nrow(X_test_enriched)) # devrait renvoyer TRUE
+```
+
+#### Données sur les mouvements de terrain
+
+De la même manière que pour les données d'inondations, nous enrichissons notre jeu de données avec un indicateur spécifique aux mouvements de terrain, un autre type de risque naturel qui peut impacter significativement la probabilité de sinistres sur les bâtiments. Cet indicateur représente le nombre de reconnaissances de l'état de catastrophe naturelle pour les mouvements de terrain, publiées au Journal Officiel depuis 1982. Les mouvements de terrain comprennent divers phénomènes tels que les glissements de terrain, les effondrements, les chutes de pierres, et les tassements différentiels.
+
+L'ajout de cet indicateur aux données de chaque commune nous permet d'intégrer une dimension temporelle longue et de capter la fréquence à laquelle une commune a été confrontée à ce type de risque naturel.
+
+```{r mvtterrain, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# URL vers le fichier ZIP contenant les données CATNAT sur les mouvements de terrain
+url_zip_mvt <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbReco_Mvt.zip"
+destfile_zip_mvt <- tempfile(fileext = ".zip")
+download.file(url_zip_mvt, destfile_zip_mvt)
+unzip(destfile_zip_mvt, exdir = tempdir())
+
+# Lecture du fichier Excel et sélection de la deuxième feuille de calcul (sheet = 2)
+# Renommage de la colonne "Code INSEE" en "Insee" pour plus de clarté
+# Remplacement des valeurs "Pas de reconnaissance" par "0"
+# Conversion de la colonne en format numérique
+path_excel_mvt <- file.path(tempdir(), "ONRN_nbRecos_Mvt_8222.xlsx")
+nombre_mouvements <- read_excel(path_excel_mvt, sheet = 2)
+
+nombre_mouvements <- nombre_mouvements %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nmouvement de terrain` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`))
+
+# Enrichissement de X_train et X_test avec les données CATNAT sur le nombre de mouvement de terrain
+# en utilisant le code INSEE comme clé de jointure
+X_train_enriched <- left_join(X_train_enriched, nombre_mouvements, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_mouvements, by = "Insee")
+```
+
+Vérification
+
+```{r verifmvtterrain, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+all.equal(nrow(X_train), nrow(X_train_enriched)) # devrait renvoyer TRUE
+all.equal(nrow(X_test), nrow(X_test_enriched)) # devrait renvoyer TRUE
+```
+
+#### Données sur les sécheresses
+
+Pour enrichir davantage notre analyse, nous ajoutons également des données relatives aux mouvements de terrain différentiels causés par la sécheresse et la réhydratation des sols. Cet indicateur recense le nombre de reconnaissances de l'état de catastrophe naturelle spécifiquement attribuées à ce phénomène, telles qu'enregistrées au Journal Officiel depuis 1982.
+
+Ces mouvements de terrain sont particulièrement pertinents pour les compagnies d'assurance car ils reflètent un type de sinistre qui peut causer des dommages structurels significatifs aux bâtiments. Ils sont généralement liés à des cycles climatiques qui provoquent une alternance de périodes de sécheresse et de réhydratation, entraînant des changements volumétriques dans les sols argileux qui peuvent affecter les fondations et la stabilité des constructions.
+
+```{r sécheresse, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# URL vers le fichier ZIP contenant les données CATNAT sur les sécheresses
+url_zip_secheresse <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbRecos_Sech.zip"
+destfile_zip_secheresse <- tempfile(fileext = ".zip")
+download.file(url_zip_secheresse, destfile_zip_secheresse)
+unzip(destfile_zip_secheresse, exdir = tempdir())
+
+path_excel_secheresse <- file.path(tempdir(), "ONRN_nbRecos_Sech_8222.xlsx")
+nombre_secheresse <- read_excel(path_excel_secheresse, sheet = 2)
+
+nombre_secheresse <- nombre_secheresse %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nsécheresse` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nsécheresse`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nsécheresse` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nsécheresse`))
+
+# Enrichissement de X_train et X_test avec les données CATNAT sur le nombre de sécheresse
+# en utilisant le code INSEE comme clé de jointure
+X_train_enriched <- left_join(X_train_enriched, nombre_secheresse, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_secheresse, by = "Insee")
+```
+
+Vérification
+
+```{r vérifsécheresse, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+all.equal(nrow(X_train), nrow(X_train_enriched)) # devrait renvoyer TRUE
+all.equal(nrow(X_test), nrow(X_test_enriched)) # devrait renvoyer TRUE
+```
+
+#### Données sur les séismes
+
+Nous poursuivons l’enrichissement de notre jeu de données avec un indicateur dédié aux séismes. Ce dernier représente le nombre de reconnaissances de l'état de catastrophe naturelle pour les séismes par commune, enregistrées au Journal Officiel depuis 1982. Les séismes sont des événements naturels d’une grande importance dans l’évaluation des risques en assurance, en raison de leur potentiel destructeur pour les structures bâties.
+
+```{r séismes, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# URL vers le fichier ZIP contenant les données CATNAT sur les séismes
+url_zip_séisme <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbRecos_Seisme.zip"
+destfile_zip_séisme <- tempfile(fileext = ".zip")
+download.file(url_zip_séisme, destfile_zip_séisme)
+unzip(destfile_zip_séisme, exdir = tempdir())
+
+path_excel_séisme <- file.path(tempdir(), "ONRN_nbRecos_Seisme_8222.xlsx")
+nombre_séisme <- read_excel(path_excel_séisme, sheet = 2)
+
+nombre_séisme <- nombre_séisme %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nséisme` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nséisme`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nséisme` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nséisme`))
+
+# Enrichissement de X_train et X_test avec les données CATNAT sur le nombre de séisme
+# en utilisant le code INSEE comme clé de jointure
+X_train_enriched <- left_join(X_train_enriched, nombre_séisme, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_séisme, by = "Insee")
+```
+
+Vérification
+
+```{r vérifséismes, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+all.equal(nrow(X_train), nrow(X_train_enriched)) # devrait renvoyer TRUE
+all.equal(nrow(X_test), nrow(X_test_enriched)) # devrait renvoyer TRUE
+```
+
+### *Importation de données sur la criminalité*
+
+#### Données sur les cambriolages
+
+En plus des catastrophes naturelles, les données liées aux incidents de sécurité, comme les cambriolages, sont également cruciales pour l'évaluation des risques en assurance bâtiment. Nous intégrons donc un indicateur du taux moyen de cambriolage par département, basé sur les données collectées entre 2015 et 2019. Les cambriolages, en tant que sinistres potentiels, peuvent influencer considérablement le risque associé à une police d'assurance bâtiment.
+
+```{r cambriolage, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# URL du fichier Excel contenant les données sur le taux de cambriolage
+url_cambriolage <- "https://www.insee.fr/fr/statistiques/fichier/5039869/FET2021-12.xlsx"
+
+# Créer un chemin temporaire pour le fichier téléchargé
+invisible(temp_file <- tempfile(fileext = ".xlsx"))
+
+# Télécharger le fichier
+invisible(httr::GET(url_cambriolage, httr::write_disk(temp_file)))
+
+# Lire le fichier Excel téléchargé
+taux_cambriolage <- read_excel(temp_file, sheet = 1)
+
+# Calculer le nombre total de lignes à conserver
+n <- nrow(taux_cambriolage) - 4  # Soustrait 4 pour les quatre dernières lignes
+
+# Supprimer la première et les quatre dernières lignes
+taux_cambriolage <- taux_cambriolage[2:n, ]  # Commence à 2 pour sauter la première ligne
+
+# Sélectionne et renomme les colonnes numéro de département et taux de camrbiolage
+taux_cambriolage <- taux_cambriolage %>%
+  select(Numéro_Départements = 1, `Taux de Cambriolage` = 3)
+
+# Joindre taux_cambriolage avec X_train_enriched et X_test_enriched
+X_train_enriched <- left_join(X_train_enriched, taux_cambriolage, by = "Numéro_Départements")
+X_test_enriched <- left_join(X_test_enriched, taux_cambriolage, by = "Numéro_Départements")
+
+```
+
+Vérification
+
+```{r vérifcambriolage, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+all.equal(nrow(X_train), nrow(X_train_enriched)) # devrait renvoyer TRUE
+all.equal(nrow(X_test), nrow(X_test_enriched)) # devrait renvoyer TRUE
+```
+
+```{r nettoyage, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# Nettoyage des données
+X_train_enriched <- X_train_enriched %>%
+  select(-Nom_de_la_commune, -Code_postal, -Libellé_d_acheminement, 
+         -Numéro_Départements, -Commune.x, -Commune.y, -Commune.x.x, -Commune.y.y, -Insee)
+
+X_test_enriched <- X_test_enriched %>%
+  select(-Nom_de_la_commune, -Code_postal, -Libellé_d_acheminement, 
+         -Numéro_Départements,-Commune.x, -Commune.y, -Commune.x.x, -Commune.y.y, -Insee)
+
+combined_data <- left_join(X_train_enriched, Y_train, by = "Identifiant")
+```
+
+```{r graphcambriolage, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# Filtrer les valeurs NA pour le taux de cambriolage (exclure les NA)
+X_train_enriched_sans_NA <- X_train_enriched %>% filter(!is.na(`Taux de Cambriolage`))
+
+# Assurer que la colonne `Taux de Cambriolage` est au format numérique
+X_train_enriched_sans_NA$`Taux de Cambriolage` <- as.numeric(as.character(X_train_enriched_sans_NA$`Taux de Cambriolage`))
+
+# Calcul du taux de cambriolage moyen par région
+taux_cambriolage_region <- X_train_enriched_sans_NA %>%
+  group_by(Nom_région) %>%
+  summarise(Taux_Cambriolage_Moyen = mean(`Taux de Cambriolage`, na.rm = TRUE)) %>%
+  arrange(desc(Taux_Cambriolage_Moyen))
+
+# Céation du graphique
+ggplot(taux_cambriolage_region, aes(x = reorder(Nom_région, -Taux_Cambriolage_Moyen), y = Taux_Cambriolage_Moyen, fill = Nom_région)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Taux de cambriolage moyen par région entre 1995 et 2019", x = "Région", y = "Taux de Cambriolage Moyen") +
+  theme_minimal() +
+  scale_fill_viridis_d()
+```
+
+
+```{r graphinnondations, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# Assurer que les valeurs d'inondation sont numériques : conversion en format numérique
+X_train_enriched$`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` <- 
+  as.numeric(as.character(X_train_enriched$`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`))
+
+# Filtrer les lignes où les inondations ou la région sont NA avant de faire le résumé
+X_train_enriched_sans_NA <- X_train_enriched %>%
+  filter(!is.na(Nom_région),
+         !is.na(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`))
+
+# Calcul du nombre total d'inondations par région
+inondations_par_region <- X_train_enriched_sans_NA %>%
+  group_by(Nom_région) %>%
+  summarise(Total_Inondations = sum(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`, na.rm = TRUE)) %>%
+  arrange(desc(Total_Inondations))
+
+# Création du graphique
+ggplot(inondations_par_region, aes(x = reorder(Nom_région, -Total_Inondations), y = Total_Inondations, fill = Nom_région)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Nombre total d'inondations par région entre 1995 et 2019", x = "Région", y = "Nombre total d'inondations") +
+  theme_minimal() +
+  scale_fill_viridis_d()
+```
+
+
+```{r graphmvtterrains, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# Assurer que les valeurs des mouvements de terrain sont numériques : conversion en format numérique
+X_train_enriched$`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain` <- 
+  as.numeric(as.character(X_train_enriched$`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`))
+
+# Filtrer les lignes où les mouvements de terrain ou la région sont NA avant de faire le résumé
+X_train_enriched_sans_NA <- X_train_enriched %>%
+  filter(!is.na(Nom_région),
+         !is.na(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`))
+
+# Calcul du nombre total de mouvement de terrain par région
+mouvement_terrains_par_region <- X_train_enriched_sans_NA %>%
+  group_by(Nom_région) %>%
+  summarise(Total_mvt = sum(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`, na.rm = TRUE)) %>%
+  arrange(desc(Total_mvt))
+
+# Création du graphique
+ggplot(mouvement_terrains_par_region, aes(x = reorder(Nom_région, -Total_mvt), y = Total_mvt, fill = Nom_région)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Nombre total de mouvement de terrain par région entre 1995 et 2019", x = "Région", y = "Nombre total de mouvement de terrain") +
+  theme_minimal() +
+  scale_fill_viridis_d()
+
+```
+
+```{r graphsecheresse, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+
+# Convertir 'Nombre de reconnaissances Cat Nat sécheresse' en numérique et gérer les NA
+X_train_enriched$`Nombre de reconnaissances Cat Nat\r\nsécheresse` <- 
+  as.numeric(as.character(X_train_enriched$`Nombre de reconnaissances Cat Nat\r\nsécheresse`))
+
+# Filtrer les lignes où la région ou les données sur les sécheresses sont NA avant de faire le résumé
+X_train_enriched_sans_NA <- X_train_enriched %>%
+  filter(!is.na(Nom_région),
+         !is.na(`Nombre de reconnaissances Cat Nat\r\nsécheresse`))
+
+# Calculer le nombre total de sécheresses par région
+sécheresses_par_region <- X_train_enriched_sans_NA %>%
+  group_by(Nom_région) %>%
+  summarise(Total_sécheresse = sum(`Nombre de reconnaissances Cat Nat\r\nsécheresse`, na.rm = TRUE)) %>%
+  arrange(desc(Total_sécheresse))
+
+# Création du graphique
+ggplot(sécheresses_par_region, aes(x = reorder(Nom_région, -Total_sécheresse), y = Total_sécheresse, fill = Nom_région)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Nombre total de sécheresses par région entre 1995 et 2019", x = "Région", y = "Nombre total de sécheresses") +
+  theme_minimal() +
+  scale_fill_viridis_d()
+
+```
+
+
+```{r graphséisme, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# Convertir 'Nombre de reconnaissances Cat Nat séisme' en numérique et gérer les NA
+X_train_enriched$`Nombre de reconnaissances Cat Nat\r\nséisme` <- 
+  as.numeric(as.character(X_train_enriched$`Nombre de reconnaissances Cat Nat\r\nséisme`))
+
+# Filtrer les lignes où la région ou les données sur les séismes sont NA avant de faire le résumé
+X_train_enriched_sans_NA <- X_train_enriched %>%
+  filter(!is.na(Nom_région),
+         !is.na(`Nombre de reconnaissances Cat Nat\r\nséisme`))
+
+# Calculer le nombre total de séismes par région
+séismes_par_region <- X_train_enriched_sans_NA %>%
+  group_by(Nom_région) %>%
+  summarise(Total_séismes = sum(`Nombre de reconnaissances Cat Nat\r\nséisme`, na.rm = TRUE)) %>%
+  arrange(desc(Total_séismes))
+
+# Création du graphique
+ggplot(séismes_par_region, aes(x = reorder(Nom_région, -Total_séismes), y = Total_séismes, fill = Nom_région)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "Nombre total de séisme par région entre 1995 et 2019", x = "Région", y = "Nombre total de séismes") +
+  theme_minimal() +
+  scale_fill_viridis_d()
+```
+
+**Matrice de corrélation**
+
+```{r nettoyageeee, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+#### Netoyage de données 
+
+X_test_enriched <- X_test_enriched %>%
+  select(-Nom_département, -Nom_région) %>%
+  rename(
+    `Nombre_inondations` = `Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`,
+    `Nombre_mouvement_de_terrain` = `Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`,
+    `Nombre_de_sécheresse` = `Nombre de reconnaissances Cat Nat\r\nsécheresse`,
+    `Nombre_de_séisme` = `Nombre de reconnaissances Cat Nat\r\nséisme`,
+    `taux_cambriolage`=`Taux de Cambriolage`
+  )
+
+X_train_enriched <- X_train_enriched %>%
+  select(-Nom_département, -Nom_région) %>%
+  rename(
+    `Nombre_inondations` = `Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`,
+    `Nombre_mouvement_de_terrain` = `Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`,
+    `Nombre_de_sécheresse` = `Nombre de reconnaissances Cat Nat\r\nsécheresse`,
+    `Nombre_de_séisme` = `Nombre de reconnaissances Cat Nat\r\nséisme`,
+    `taux_cambriolage`=`Taux de Cambriolage`
+  )
+
+# Créer une copie de X_train_enriched dans X_train_enriched_target, puis pour ajouter une colonne target à cette copie, dont les valeurs sont extraites de Y_train$target.
+X_train_enriched_target <-X_train_enriched
+X_train_enriched_target$target <- Y_train$target
+
+# Sélectionner uniquement les variables numériques (y compris 'target' si elle est numérique)
+num_vars_with_target <- X_train_enriched_target %>% select_if(is.numeric)
+
+# Calculer la matrice de corrélation avec la variable cible incluse
+cor_matrix_with_target <- cor(num_vars_with_target, use = "complete.obs")
+
+# Utiliser cairo pour mieux gérer la sauvegarde en mémoire
+cairo_pdf(filename = NULL)
+invisible(corrplot(cor_matrix_with_target, method = "color", type = "upper", order = "hclust",
+         tl.col = "black", tl.srt = 55, tl.cex = 0.5,
+         col = colorRampPalette(c("#6D9EC1", "white", "#E46726"))(200)))
+invisible(dev.off())
+
+# Sauvegarder temporairement l'image pour l'encoder
+tempfile <- tempfile(fileext = ".png")
+png(tempfile, width = 5500, height = 5500, res = 250)
+invisible(corrplot(cor_matrix_with_target, method = "color", type = "upper", order = "hclust",
+         tl.col = "black", tl.srt = 55, tl.cex = 0.5,
+         col = colorRampPalette(c("#6D9EC1", "white", "#E46726"))(200)))
+invisible(dev.off())
+
+# Lire l'image et l'encoder en base64
+library(base64enc)
+data_uri <- dataURI(file = tempfile, mime = "image/png")
+
+##
+
+```
+
+Nous avons utilisé une approche spécifique pour visualiser la matrice de corrélation entre les variables numériques, y compris la variable cible. Lorsque nous avons simplement tracé la matrice de corrélation, nous avons constaté que l'affichage n'était pas optimal, ce qui rendait difficile la lecture et l'interprétation des résultats.
+
+Pour remédier à ce problème, nous avons adopté une approche en deux étapes. Tout d'abord, nous avons utilisé la fonction corrplot pour créer un graphique de la matrice de corrélation. Ensuite, pour garantir une meilleure qualité d'affichage, nous avons sauvegardé ce graphique à la fois dans un fichier PDF en mémoire et dans un fichier PNG temporaire. Cette étape nous a permis de manipuler l'image de manière plus flexible.
+
+Ensuite, nous avons utilisé la bibliothèque base64enc pour encoder l'image PNG en base64. Cette étape est particulièrement utile si nous voulons incorporer l'image directement notre fichier Rmd. En encodant l'image en base64, nous pouvons l'intégrer facilement dans différents contextes sans avoir à manipuler des fichiers séparés.
+
+Notre analyse de la matrice de corrélation révèle que la majorité des variables examinées fournissent des contributions distinctes au modèle. Ce constat est prometteur car il indique un minimum de chevauchement informationnel entre les variables, réduisant ainsi le risque de multicollinéarité lors de la modélisation prédictive. Cela signifie que chaque variable a le potentiel d'améliorer la robustesse du modèle sans empiéter sur l'information déjà apportée par une autre.
+
+En particulier, la corrélation observée entre la variable superficief et la variable cible target est la plus élevée. Il est logique de supposer qu'un bâtiment de plus grande superficie ait un risque plus élevé de sinistre, puisqu'il y a davantage de surface susceptible d'être impactée.
+
+
+### **Modélisation**
+
+#### 1. Arbre de classification 
+
+Le premier modèle utilise un arbre de classification pour prédire la probabilité qu'un bâtiment dépose une réclamation d'assurance pendant une période donnée, en se basant sur ses caractéristiques. 
+
+**Étape 1 : Préparation des données**
+
+Nous avons réparti notre jeu de données initial en deux sous-ensembles : 80% pour l'entraînement et 20% pour le test. Cette séparation a été réalisée en stratifiant selon la variable cible pour garantir une distribution équilibrée des classes dans chaque sous-ensemble.
+
+**Étape 2 : Prétraitement des données**
+
+Nous avons identifié les variables catégorielles comme celles ayant moins de 20 valeurs uniques et les avons converties en facteurs dans l'ensemble d'entraînement, ce qui est nécessaire pour la construction de l'arbre de décision.
+
+Nous avons renommé plusieurs colonnes complexes en noms plus courts et plus compréhensibles, qui reflètent les différents types de catastrophes naturelles. Cette étape est cruciale pour faciliter les manipulations et les analyses ultérieures.
+
+Les valeurs de la colonne EXPO, exprimées initialement avec des virgules comme séparateurs décimaux, ont été converties en format numérique en remplaçant les virgules par des points, puis en les convertissant en type numérique. Nous avons également vérifié et imputé les valeurs manquantes par la médiane pour cette colonne et d'autres colonnes numériques.
+
+Dans le traitement des ensembles de données X_train_enriched et X_test_enriched, nous choisissons de retirer certaines colonnes qui ne sont pas utiles pour notre modèle. Les variables supprimées sont principalement des identifiants géographiques et des labels qui pourraient introduire du bruit ou un biais dans notre modèle, ou qui sont tout simplement redondantes.
+
+Enfin, nous ajustons la colonne Taux_de_Cambriolage pour garantir que les données sont numériques et uniformément formatées (remplacement des virgules par des points et suppression des caractères non numériques). Nous calculons la médiane pour les valeurs de cambriolage et utilisons cette médiane pour imputer les valeurs manquantes dans cette colonne.
+
+**Étape 3 : Construction et évaluation de l'arbre de décision**
+
+Nous avons ensuite construit un arbre de décision en utilisant la fonction rpart. Pour comprendre l'importance des différentes variables et la structure de l'arbre, nous avons visualisé celui-ci avec la fonction prp, en montrant les informations supplémentaires telles que le gain d'information à chaque nœud.
+
+Nous avons évalué les performances de notre modèle sur les ensembles d'apprentissage et de test à l'aide d'une matrice de confusion, nous permettant de calculer des mesures telles que la précision, la sensibilité, la spécificité, et la valeur prédictive.
+
+```{r arbre, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+X_test <- read_csv("X_test.csv") %>% select(-`...1`)
+X_train <- read_csv("X_train.csv") %>% select(-`...1`)
+Y_train <- read_csv("y_train_saegPGl.csv")$target
+
+url_csv <- "https://www.data.gouv.fr/fr/datasets/r/edcfd5d7-5c97-4e86-8d27-e21c7e30a721"
+correspondance_df <- read_csv2(url_csv, locale = locale(encoding = "ISO-8859-1")) %>%
+  rename(Insee = `#Code_commune_INSEE`) %>%
+  distinct(Insee, .keep_all = TRUE)
+
+X_train_enriched <- left_join(X_train, correspondance_df, by = "Insee")
+X_test_enriched <- left_join(X_test, correspondance_df, by = "Insee")
+
+url_zip <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbReco_Inondation.zip"
+
+destfile_zip <- tempfile(fileext = ".zip")
+
+download.file(url_zip, destfile_zip)
+
+unzip(destfile_zip, exdir = tempdir())
+
+path_excel <- file.path(tempdir(), "ONRN_nbRecos_Inon_8222.xlsx")
+
+nombre_inondations <- read_excel(path_excel, sheet = 2) %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` = 
+           if_else(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` == "Pas de reconnaissance", 
+                   "0", 
+                   `Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`)) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`))
+
+X_train_enriched <- left_join(X_train_enriched, nombre_inondations, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_inondations, by = "Insee")
+
+url_zip_mvt <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbReco_Mvt.zip"
+destfile_zip_mvt <- tempfile(fileext = ".zip")
+download.file(url_zip_mvt, destfile_zip_mvt)
+unzip(destfile_zip_mvt, exdir = tempdir())
+
+path_excel_mvt <- file.path(tempdir(), "ONRN_nbRecos_Mvt_8222.xlsx")
+nombre_mouvements <- read_excel(path_excel_mvt, sheet = 2)
+
+nombre_mouvements <- nombre_mouvements %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nmouvement de terrain` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`))
+
+X_train_enriched <- left_join(X_train_enriched, nombre_mouvements, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_mouvements, by = "Insee")
+
+url_zip_secheresse <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbRecos_Sech.zip"
+destfile_zip_secheresse <- tempfile(fileext = ".zip")
+download.file(url_zip_secheresse, destfile_zip_secheresse)
+unzip(destfile_zip_secheresse, exdir = tempdir())
+
+path_excel_secheresse <- file.path(tempdir(), "ONRN_nbRecos_Sech_8222.xlsx")
+nombre_secheresse <- read_excel(path_excel_secheresse, sheet = 2)
+
+nombre_secheresse <- nombre_secheresse %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nsécheresse` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nsécheresse`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nsécheresse` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nsécheresse`))
+
+X_train_enriched <- left_join(X_train_enriched, nombre_secheresse, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_secheresse, by = "Insee")
+
+url_zip_séisme <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbRecos_Seisme.zip"
+destfile_zip_séisme <- tempfile(fileext = ".zip")
+download.file(url_zip_séisme, destfile_zip_séisme)
+unzip(destfile_zip_séisme, exdir = tempdir())
+
+path_excel_séisme <- file.path(tempdir(), "ONRN_nbRecos_Seisme_8222.xlsx")
+nombre_séisme <- read_excel(path_excel_séisme, sheet = 2)
+
+nombre_séisme <- nombre_séisme %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nséisme` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nséisme`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nséisme` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nséisme`))
+
+X_train_enriched <- left_join(X_train_enriched, nombre_séisme, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_séisme, by = "Insee")
+
+X_train_enriched$Numéro_Départements <- substr(X_train_enriched$Code_postal, 1, 2)
+
+X_test_enriched$Numéro_Départements <- substr(X_test_enriched$Code_postal, 1, 2)
+
+invisible(url_cambriolage <- "https://www.insee.fr/fr/statistiques/fichier/5039869/FET2021-12.xlsx")
+
+invisible(temp_file <- tempfile(fileext = ".xlsx"))
+
+invisible(httr::GET(url_cambriolage, httr::write_disk(temp_file)))
+
+taux_cambriolage <- read_excel(temp_file, sheet = 1)
+
+n <- nrow(taux_cambriolage) - 4 
+
+taux_cambriolage <- taux_cambriolage[2:n, ]  # Commence à 2 pour sauter la première ligne
+
+taux_cambriolage <- taux_cambriolage %>%
+  select(Numéro_Départements = 1, `Taux_de_Cambriolage` = 3)
+
+X_train_enriched <- left_join(X_train_enriched, taux_cambriolage, by = "Numéro_Départements")
+X_test_enriched <- left_join(X_test_enriched, taux_cambriolage, by = "Numéro_Départements")
+
+# Renommer les colonnes du dataframe X_test_enriched pour plus de clarté
+X_test_enriched <- X_test_enriched %>%
+  rename(
+    `Nombre_inondations` = `Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`,
+    `Nombre_mouvement_de_terrain` = `Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`,
+    `Nombre_de_sécheresse` = `Nombre de reconnaissances Cat Nat\r\nsécheresse`,
+    `Nombre_de_séisme` = `Nombre de reconnaissances Cat Nat\r\nséisme`
+  )
+
+# Appliquer le même renommage des colonnes pour le dataframe X_train_enriched
+X_train_enriched <- X_train_enriched %>%
+  rename(
+    `Nombre_inondations` = `Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`,
+    `Nombre_mouvement_de_terrain` = `Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`,
+    `Nombre_de_sécheresse` = `Nombre de reconnaissances Cat Nat\r\nsécheresse`,
+    `Nombre_de_séisme` = `Nombre de reconnaissances Cat Nat\r\nséisme`
+  )
+
+# Remplacer les virgules par des points dans la colonne EXPO du jeu de données d'entraînement
+X_train_enriched$EXPO <- gsub(",", ".", X_train_enriched$EXPO)
+# Remplacer les virgules par des points dans la colonne EXPO du jeu de données de test
+X_test_enriched$EXPO <- gsub(",", ".", X_test_enriched$EXPO)
+
+# Convertir EXPO en numérique
+X_train_enriched$EXPO <- as.numeric(X_train_enriched$EXPO)
+X_test_enriched$EXPO <- as.numeric(X_test_enriched$EXPO)
+
+invisible(sum(is.na(X_train_enriched$EXPO)))
+invisible(sum(is.na(X_test_enriched$EXPO)))
+
+# Imputation avec la médiane pour les colonnes numériques
+numeric_cols <- sapply(X_train_enriched, is.numeric)
+X_train_enriched[numeric_cols] <- lapply(X_train_enriched[numeric_cols], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+X_test_enriched[numeric_cols] <- lapply(X_test_enriched[numeric_cols], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+
+# Vérifier s'il y a des valeurs NA après la conversion
+invisible(sum(is.na(X_train_enriched$EXPO)))
+invisible(sum(is.na(X_test_enriched$EXPO)))
+
+# Imputation avec la médiane pour les colonnes numériques
+numeric_cols <- sapply(X_train_enriched, is.numeric)
+X_train_enriched[numeric_cols] <- lapply(X_train_enriched[numeric_cols], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+X_test_enriched[numeric_cols] <- lapply(X_test_enriched[numeric_cols], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+
+# Vérifier s'il y a des valeurs NA après la conversion
+invisible(sum(is.na(X_train_enriched$EXPO)))
+invisible(sum(is.na(X_test_enriched$EXPO)))
+
+invisible(colSums(is.na(X_train_enriched)))
+
+# Ajouter la colonne cible du jeu de données d'entraînement
+X_train_enriched$target <- Y_train
+
+# Supprimer certaines colonnes non pertinentes du jeu de données d'entraînement
+X_train_enriched <- X_train_enriched %>%
+  select(-Ligne_5,-Nom_de_la_commune, -Code_postal, -Libellé_d_acheminement, 
+         -Numéro_Départements, -Commune.x, -Commune.y, -Commune.x.x, -Commune.y.y, -Insee)
+
+# Supprimer certaines colonnes non pertinentes du jeu de données de test
+X_test_enriched <- X_test_enriched %>%
+  select(-Ligne_5,-Nom_de_la_commune, -Code_postal, -Libellé_d_acheminement, 
+         -Numéro_Départements,-Commune.x, -Commune.y, -Commune.x.x, -Commune.y.y, -Insee)
+
+# Vérification des valeurs manquantes
+invisible(colSums(is.na(X_train_enriched)))
+
+# Remplacer les virgules par des points et supprimer tout caractère non numérique
+taux_cambriolage$`Taux_de_Cambriolage` <- gsub(",", ".", taux_cambriolage$`Taux_de_Cambriolage`)
+taux_cambriolage$`Taux_de_Cambriolage` <- as.numeric(gsub("[^0-9.]", "", taux_cambriolage$`Taux_de_Cambriolage`))
+
+# Calcul de la médiane ou de la moyenne pour les taux de cambriolage
+median_cambriolage <- median(taux_cambriolage$`Taux_de_Cambriolage`, na.rm = TRUE)
+
+# Imputation des valeurs NA par la médiane
+X_train_enriched$`Taux_de_Cambriolage`[is.na(X_train_enriched$`Taux_de_Cambriolage`)] <- median_cambriolage
+X_test_enriched$`Taux_de_Cambriolage`[is.na(X_test_enriched$`Taux_de_Cambriolage`)] <- median_cambriolage
+
+```
+
+```{r arbremodèle, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+
+# Définition de la graine aléatoire
+set.seed(14032024)
+# Division de l'ensemble de données en ensembles d'entraînement et de test
+splits <- initial_split(X_train_enriched, strata = Y_train, prop = 0.8) # spécifie que 80% des données seront attribuées à l'ensemble d'entraînement (train_set) et 20% à l'ensemble de test (test_set)
+train_set <- training(splits) # ensemble de données d'entraînement extrait à partir de splits
+test_set <- testing(splits) # ensemble de données de test extrait à partir de splits
+
+# Identifier les colonnes catégorielles potentielles
+# Supposons que nous considérons une variable comme catégorielle si elle a moins de 20 valeurs uniques (une convention courante dans de nombreuses analyses de données)
+# Identifier les colonnes catégorielles basées sur le nombre de valeurs uniques
+cat_cols <- sapply(X_train_enriched, function(x) length(unique(x)) < 20)
+cat_cols_names <- names(cat_cols[cat_cols == TRUE])
+
+# Convertir les variables catégorielles en facteurs pour l'ensemble de formation
+X_train_enriched[cat_cols_names] <- lapply(X_train_enriched[cat_cols_names], factor)
+
+# Construction de l'arbre de décision
+model_tree <- rpart(target ~ ., data = train_set, method = "class")
+invisible(model_tree)
+
+# Visualisation de l'arbre
+prp(model_tree, extra = 1)
+
+# Évaluation sur l'ensemble d'apprentissage
+pred_train_tree <- predict(model_tree, train_set, type = "class")
+confusionMatrix(pred_train_tree, reference = as.factor(train_set$target))
+
+# Évaluation sur l'ensemble de test
+pred_test_tree <- predict(model_tree, test_set, type = "class")
+confusionMatrix(pred_test_tree, reference = as.factor(test_set$target))
+
+# AUC pour l'arbre
+roc_tree <- roc(test_set$target, predict(model_tree, test_set, type = "prob")[,2])
+plot(roc_tree)
+```
+
+Le modèle présente une sensibilité élevée mais une spécificité très faible, ce qui signifie qu'il est bon pour détecter les cas positifs mais tend à mal classer de nombreux cas négatifs comme positifs. La valeur Kappa faible dans les deux cas indique également que la précision du modèle n'est pas beaucoup meilleure que le hasard, en particulier dans des situations où le taux de prévalence de l'une des classes est élevé. 
+
+**Étape 4 : Analyse de la performance du modèle**
+
+Pour quantifier la capacité de notre modèle à distinguer entre les différentes classes, nous avons calculé l'AUC et, en conséquence, le score Gini normalisé. Ces mesures nous donnent une indication de la qualité de notre modèle dans le contexte de la prédiction des réclamations d'assurance pour les bâtiments.
+
+```{r perfarbre, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+auc(roc_tree)
+
+# Calcul du score AUC pour l'arbre de décision
+auc_tree <- auc(roc_tree)
+
+# Calcul du score Gini à partir de l'AUC
+gini_score <- 2 * auc_tree - 1
+
+# Affichage du score Gini
+print(paste("Le score Gini pour le modèle de l'arbre de décision est :", gini_score))
+```
+
+**Étape 5 : Prédiction des probabilités**
+
+Après avoir entraîné notre arbre de décision et évalué ses performances avec l'AUC et le score Gini, nous avons appliqué le modèle à notre ensemble de données de test enrichi pour prédire les probabilités de réclamations d'assurance. En utilisant la fonction predict et en spécifiant le type de sortie comme "prob", notre modèle a généré les probabilités correspondantes pour chaque bâtiment dans l'ensemble de test, nous donnant ainsi des informations précieuses sur le risque associé à chaque propriété.
+
+```{r predarbre, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# Prédiction des probabilités sur l'ensemble de données de test enrichi
+prob_predictions <- predict(model_tree, X_test_enriched, type = "prob")
+
+### Préparation du fichier de soumission 
+# Sélection de la colonne de probabilité pour la classe positive 
+positive_class_probabilities <- prob_predictions[,2]
+
+# Création d'un dataframe pour la soumission avec la colonne d'identifiant et la probabilité de la classe positive
+submission <- data.frame(Index = 0:(nrow(X_test_enriched) - 1), Identifiant = X_test_enriched$Identifiant, target = positive_class_probabilities)
+
+# Écriture du dataframe dans un fichier CSV
+write.csv(submission, "predicition_arbre.csv", row.names = FALSE)
+```
+
+Afin de participer au Data Challenge de l'ENS, nous avons préparé un fichier de soumission comprenant les probabilités estimées de sinistre pour chaque bâtiment. Ce fichier aligne les identifiants des bâtiments avec les probabilités correspondantes, suivant le format requis par la plateforme du challenge.
+
+La soumission de ce fichier sur le site du Data Challenge ENS a permis de convertir nos prédictions en un score de 0,1756. 
+
+**Conclusion**
+
+L'analyse des performances de notre arbre de décision a fourni des insights pertinents sur ses capacités prédictives. Avec un AUC de 0.6056, le modèle démontre une certaine aptitude à distinguer les bâtiments susceptibles de subir un sinistre de ceux qui ne le sont pas, bien que l'espace pour améliorer sa discrimination soit notable. Le score Gini normalisé de 0.2111 renforce cette observation, indiquant que, bien que le modèle soit meilleur que le hasard, il y a une marge significative d'amélioration.
+
+Fort de ces conclusions, nous avons entrepris de développer un deuxième modèle prédictif en utilisant l'algorithme avancé XGBoost. XGBoost, ou eXtreme Gradient Boosting, est une méthode d'apprentissage automatique qui s'est imposée dans les domaines du machine learning pour sa performance dans les tâches de classification et de régression. Ce modèle promet d'exploiter la structure des données d'une manière plus raffinée et potentiellement plus efficace grâce à ses capacités d'apprentissage en profondeur.
+
+Transitionnant de l'approche de modélisation basée sur un arbre unique, XGBoost nous permet de combiner les prédictions de nombreux arbres de décision, potentiellement améliorant la robustesse et l'exactitude des prédictions. Notre objectif avec ce deuxième modèle est de capturer des interactions plus complexes entre les variables et de fournir une prédiction plus nuancée des probabilités de sinistre pour chaque bâtiment.
+
+Dans les étapes suivantes, nous détaillons notre approche pour préparer les données pour XGBoost, optimiser ses paramètres et évaluer ses performances, visant à surpasser le modèle initial d'arbre de décision.
+
+### 2. XGBoost ###
+
+Nous a développé un deuxième modèle prédictif utilisant XGBoost pour estimer la probabilité qu’un bâtiment fasse l’objet d’une réclamation d’assurance durant une période donnée. Voici comment nous avons procédé et les résultats que nous avons obtenus.
+
+**Étape 1: Préparation des données**
+
+Nous avons commencé par partitionner les données en un ensemble d'entraînement (80%) et un ensemble de test (20%), en utilisant une fonction de partitionnement pour garantir la reproductibilité des résultats grâce à l'initialisation du générateur de nombres aléatoires (set.seed(1)).
+
+Nous avons décidé d'exclure des colonnes spécifiques comme Libellé_d_acheminement, Insee, Nom_de_la_commune, et autres identificateurs qui ne sont pas utiles pour la modélisation. Ces informations sont principalement des identifiants et des descriptions textuelles qui n'apportent pas de valeur prédictive significative à notre modèle.
+
+Les données EXPO contenaient des valeurs numériques formatées avec des virgules pour les décimales, que nous avons converties en points pour uniformiser le format numérique, suivi de la conversion en type numérique réel (as.numeric).
+
+Pour les colonnes numériques, nous avons remplacé les valeurs manquantes par la médiane, qui est moins sensible aux valeurs aberrantes que la moyenne, assurant ainsi une meilleure robustesse des données.
+
+Nous ajustons la colonne Taux_de_Cambriolage pour garantir que les données sont numériques et uniformément formatées (remplacement des virgules par des points et suppression des caractères non numériques). Nous calculons la médiane pour les valeurs de cambriolage et utilisons cette médiane pour imputer les valeurs manquantes dans cette colonne.
+
+Pour les variables catégorielles comme ft_8_categ, nous les avons converties en facteurs puis en numériques, attribuant des entiers uniques à chaque catégorie.
+
+Nous avons donc converti toutes les colonnes en valeurs numériques, ce qui est une exigence pour utiliser efficacement l'algorithme de machine learning XGBoost, qui manipule des données numériques.
+
+En préparant les données de cette manière, nous assurons que notre modèle XGBoost peut être entraîné efficacement, en utilisant des caractéristiques pertinentes et bien formatées, optimisant ainsi la précision de la prédiction sur les données de test.
+
+**Étape 2: Configuration du modèle XGBoost**
+
+Pour optimiser les hyperparamètres de XGBoost, nous avons utilisé une grille de recherche (tuneGrid) avec des paramètres prédéfinis. Ces paramètres incluaient le nombre de cycles de boosting (nrounds), la profondeur maximale des arbres (max_depth), le poids minimal des enfants (min_child_weight), la fraction d'échantillons utilisés pour entraîner chaque arbre (subsample), la fraction des colonnes à utiliser par arbre (colsample_bytree), le taux d'apprentissage (eta), et le paramètre de régularisation (gamma).
+
+Nous avons ensuite utilisé une validation croisée à 10 plis pour évaluer les modèles, ce qui a permis de minimiser le sur-ajustement et d'améliorer la robustesse du modèle final.
+
+**Étape 3: Résultats et validation du modèle**
+
+Le meilleur ensemble de paramètres a été automatiquement sélectionné par la grille de recherche. Avec ces paramètres optimisés, nous avons entraîné le modèle final, utilisé pour prédire les probabilités de sinistre sur l'ensemble de test. Nous avons également produit une matrice d'importance pour identifier les variables les plus influentes dans les prédictions du modèle, et nous avons visualisé les premiers arbres du modèle pour mieux comprendre les décisions prises par le modèle.
+
+
+```{r xgboostdata, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+X_test <- read_csv("X_test.csv") %>% select(-`...1`)
+X_train <- read_csv("X_train.csv") %>% select(-`...1`)
+Y_train <- read_csv("y_train_saegPGl.csv")$target
+
+url_csv <- "https://www.data.gouv.fr/fr/datasets/r/edcfd5d7-5c97-4e86-8d27-e21c7e30a721"
+correspondance_df <- read_csv2(url_csv, locale = locale(encoding = "ISO-8859-1")) %>%
+  rename(Insee = `#Code_commune_INSEE`) %>%
+  distinct(Insee, .keep_all = TRUE)
+
+X_train_enriched <- left_join(X_train, correspondance_df, by = "Insee")
+X_test_enriched <- left_join(X_test, correspondance_df, by = "Insee")
+
+url_zip <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbReco_Inondation.zip"
+destfile_zip <- tempfile(fileext = ".zip")
+download.file(url_zip, destfile_zip)
+
+unzip(destfile_zip, exdir = tempdir())
+
+path_excel <- file.path(tempdir(), "ONRN_nbRecos_Inon_8222.xlsx")
+
+nombre_inondations <- read_excel(path_excel, sheet = 2) %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` = 
+           if_else(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` == "Pas de reconnaissance", 
+                   "0", 
+                   `Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`)) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`))
+
+X_train_enriched <- left_join(X_train_enriched, nombre_inondations, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_inondations, by = "Insee")
+
+url_zip_mvt <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbReco_Mvt.zip"
+destfile_zip_mvt <- tempfile(fileext = ".zip")
+download.file(url_zip_mvt, destfile_zip_mvt)
+unzip(destfile_zip_mvt, exdir = tempdir())
+
+path_excel_mvt <- file.path(tempdir(), "ONRN_nbRecos_Mvt_8222.xlsx")
+nombre_mouvements <- read_excel(path_excel_mvt, sheet = 2)
+
+nombre_mouvements <- nombre_mouvements %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nmouvement de terrain` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`))
+
+X_train_enriched <- left_join(X_train_enriched, nombre_mouvements, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_mouvements, by = "Insee")
+
+url_zip_secheresse <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbRecos_Sech.zip"
+destfile_zip_secheresse <- tempfile(fileext = ".zip")
+download.file(url_zip_secheresse, destfile_zip_secheresse)
+unzip(destfile_zip_secheresse, exdir = tempdir())
+
+path_excel_secheresse <- file.path(tempdir(), "ONRN_nbRecos_Sech_8222.xlsx")
+nombre_secheresse <- read_excel(path_excel_secheresse, sheet = 2)
+
+nombre_secheresse <- nombre_secheresse %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nsécheresse` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nsécheresse`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nsécheresse` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nsécheresse`))
+
+X_train_enriched <- left_join(X_train_enriched, nombre_secheresse, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_secheresse, by = "Insee")
+
+url_zip_séisme <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbRecos_Seisme.zip"
+destfile_zip_séisme <- tempfile(fileext = ".zip")
+download.file(url_zip_séisme, destfile_zip_séisme)
+unzip(destfile_zip_séisme, exdir = tempdir())
+
+path_excel_séisme <- file.path(tempdir(), "ONRN_nbRecos_Seisme_8222.xlsx")
+nombre_séisme <- read_excel(path_excel_séisme, sheet = 2)
+
+nombre_séisme <- nombre_séisme %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nséisme` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nséisme`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nséisme` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nséisme`))
+
+X_train_enriched <- left_join(X_train_enriched, nombre_séisme, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_séisme, by = "Insee")
+
+X_train_enriched$Numéro_Départements <- substr(X_train_enriched$Code_postal, 1, 2)
+
+X_test_enriched$Numéro_Départements <- substr(X_test_enriched$Code_postal, 1, 2)
+
+url_cambriolage <- "https://www.insee.fr/fr/statistiques/fichier/5039869/FET2021-12.xlsx"
+
+invisible(temp_file <- tempfile(fileext = ".xlsx"))
+
+invisible(httr::GET(url_cambriolage, httr::write_disk(temp_file)))
+
+taux_cambriolage <- read_excel(temp_file, sheet = 1)
+
+n <- nrow(taux_cambriolage) - 4 
+
+taux_cambriolage <- taux_cambriolage[2:n, ]
+
+taux_cambriolage <- taux_cambriolage %>%
+  select(Numéro_Départements = 1, `Taux_de_Cambriolage` = 3)
+
+X_train_enriched <- left_join(X_train_enriched, taux_cambriolage, by = "Numéro_Départements")
+X_test_enriched <- left_join(X_test_enriched, taux_cambriolage, by = "Numéro_Départements")
+
+cols_to_exclude <- c("Libellé_d_acheminement", "Insee", "Nom_de_la_commune", 
+                     "Code_postal", "Ligne_5", "Commune.x", "Commune.x.x", 
+                     "Commune.y", "Commune.y.y", "Numéro_Départements")
+
+X_train_enriched <- X_train_enriched %>% select(-all_of(cols_to_exclude))
+X_test_enriched <- X_test_enriched %>% select(-all_of(cols_to_exclude))
+
+X_train_enriched$EXPO <- gsub(",", ".", X_train_enriched$EXPO)
+X_test_enriched$EXPO <- gsub(",", ".", X_test_enriched$EXPO)
+
+# Convertir EXPO en numérique
+X_train_enriched$EXPO <- as.numeric(X_train_enriched$EXPO)
+X_test_enriched$EXPO <- as.numeric(X_test_enriched$EXPO)
+
+invisible(sum(is.na(X_train_enriched$EXPO)))
+invisible(sum(is.na(X_test_enriched$EXPO)))
+
+# Imputation avec la médiane pour les colonnes numériques
+numeric_cols <- sapply(X_train_enriched, is.numeric)
+X_train_enriched[numeric_cols] <- lapply(X_train_enriched[numeric_cols], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+X_test_enriched[numeric_cols] <- lapply(X_test_enriched[numeric_cols], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+
+# Vérification des valeurs manquantes
+invisible(colSums(is.na(X_train_enriched)))
+invisible(colSums(is.na(X_train_enriched)))
+
+# Remplacer les virgules par des points si nécessaire et supprimer tout caractère non numérique
+taux_cambriolage$`Taux_de_Cambriolage` <- gsub(",", ".", taux_cambriolage$`Taux_de_Cambriolage`)
+taux_cambriolage$`Taux_de_Cambriolage` <- as.numeric(gsub("[^0-9.]", "", taux_cambriolage$`Taux_de_Cambriolage`))
+
+# Calcul de la médiane ou de la moyenne pour les taux de cambriolage
+median_cambriolage <- median(taux_cambriolage$`Taux_de_Cambriolage`, na.rm = TRUE)
+
+# Imputation des valeurs NA
+X_train_enriched$`Taux_de_Cambriolage`[is.na(X_train_enriched$`Taux_de_Cambriolage`)] <- median_cambriolage
+X_test_enriched$`Taux_de_Cambriolage`[is.na(X_test_enriched$`Taux_de_Cambriolage`)] <- median_cambriolage
+
+
+
+
+X_test_enriched <- X_test_enriched %>%
+  rename(Nombre_d_innondation = `Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`) %>%
+  rename(Nombre_de_séisme=`Nombre de reconnaissances Cat Nat\r\nséisme`) %>%
+  rename(Nombre_sécheresse=`Nombre de reconnaissances Cat Nat\r\nsécheresse`)%>%
+  rename(Nombre_mouvement_terrains=`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`)%>%
+  select(-Identifiant)
+
+X_train_enriched<- X_train_enriched %>%
+  rename(Nombre_d_innondation = `Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`) %>%
+  rename(Nombre_de_séisme=`Nombre de reconnaissances Cat Nat\r\nséisme`) %>%
+  rename(Nombre_sécheresse=`Nombre de reconnaissances Cat Nat\r\nsécheresse`)%>%
+  rename(Nombre_mouvement_terrains=`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`)%>%
+  select(-Identifiant)
+
+# Convertir les variables catégorielles en variables numériques dans le jeu de données d'entraînement
+X_train_enriched <- X_train_enriched %>%
+  mutate(ft_5_categ = as.numeric(as.factor(ft_5_categ)))%>%
+  mutate(ft_6_categ = as.numeric(as.factor(ft_6_categ)))%>%
+  mutate(ft_7_categ = as.numeric(as.factor(ft_7_categ)))%>%
+  mutate(ft_8_categ = as.numeric(as.factor(ft_8_categ)))%>%
+  mutate(ft_9_categ = as.numeric(as.factor(ft_9_categ)))%>%
+  mutate(ft_10_categ = as.numeric(as.factor(ft_10_categ)))%>%
+  mutate(ft_11_categ = as.numeric(as.factor(ft_11_categ)))%>%
+  mutate(ft_12_categ = as.numeric(as.factor(ft_12_categ)))%>%
+  mutate(ft_13_categ = as.numeric(as.factor(ft_13_categ)))%>%
+  mutate(ft_14_categ = as.numeric(as.factor(ft_14_categ)))%>%
+  mutate(ft_15_categ = as.numeric(as.factor(ft_15_categ)))%>%
+  mutate(ft_16_categ = as.numeric(as.factor(ft_16_categ)))%>%
+  mutate(ft_17_categ = as.numeric(as.factor(ft_17_categ)))%>%
+  mutate(ft_18_categ = as.numeric(as.factor(ft_18_categ)))%>%
+  mutate(ft_24_categ = as.numeric(as.factor(ft_24_categ)))
+
+# Convertir les variables catégorielles en variables numériques dans le jeu de données de test
+X_test_enriched <- X_test_enriched %>%
+  mutate(ft_5_categ = as.numeric(as.factor(ft_5_categ)))%>%
+  mutate(ft_6_categ = as.numeric(as.factor(ft_6_categ)))%>%
+  mutate(ft_7_categ = as.numeric(as.factor(ft_7_categ)))%>%
+  mutate(ft_8_categ = as.numeric(as.factor(ft_8_categ)))%>%
+  mutate(ft_9_categ = as.numeric(as.factor(ft_9_categ)))%>%
+  mutate(ft_10_categ = as.numeric(as.factor(ft_10_categ)))%>%
+  mutate(ft_11_categ = as.numeric(as.factor(ft_11_categ)))%>%
+  mutate(ft_12_categ = as.numeric(as.factor(ft_12_categ)))%>%
+  mutate(ft_13_categ = as.numeric(as.factor(ft_13_categ)))%>%
+  mutate(ft_14_categ = as.numeric(as.factor(ft_14_categ)))%>%
+  mutate(ft_15_categ = as.numeric(as.factor(ft_15_categ)))%>%
+  mutate(ft_16_categ = as.numeric(as.factor(ft_16_categ)))%>%
+  mutate(ft_17_categ = as.numeric(as.factor(ft_17_categ)))%>%
+  mutate(ft_18_categ = as.numeric(as.factor(ft_18_categ)))%>%
+  mutate(ft_24_categ = as.numeric(as.factor(ft_24_categ)))
+
+
+# Convertir toutes les colonnes en numérique
+X_train_enriched <- X_train_enriched %>%
+  mutate(across(everything(), ~as.numeric(as.character(.))))
+
+X_test_enriched <- X_test_enriched %>%
+  mutate(across(everything(), ~as.numeric(as.character(.))))
+
+# Convertir la variable Taux_de_Cambriolage en numérique
+X_train_enriched <- X_train_enriched %>%
+  mutate(Taux_de_Cambriolage = as.numeric(as.character(Taux_de_Cambriolage)))
+X_test_enriched <- X_test_enriched %>%
+  mutate(Taux_de_Cambriolage = as.numeric(as.character(Taux_de_Cambriolage)))
+
+# Créer un partitionnement des données
+# Fixation de la graine aléatoire
+set.seed(1)
+# Création du partitionnement
+trainIndex <- createDataPartition(Y_train, p = 0.8, list = FALSE, times = 1)
+
+# Extraction des ensembles d'entraînement et de test :
+X_train_split <- X_train_enriched[trainIndex, ]
+Y_train_split <- Y_train[trainIndex]
+X_test_split <- X_train_enriched[-trainIndex, ]
+Y_test_split <- Y_train[-trainIndex]
+```
+
+#### Meilleurs hyperparamètres
+
+```{r xgboostmodèle, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+
+# Création d'une matrice DMatrix pour l'ensemble d'entraînement
+dtrain_split <- xgb.DMatrix(data = as.matrix(X_train_split), label = Y_train_split)
+
+# Création d'une matrice DMatrix pour l'ensemble de test 
+dtest_split <- xgb.DMatrix(data = as.matrix(X_test_split), label = Y_test_split)
+
+# Nous définissons une grille d'hyperparamètres tuneGrid pour rechercher les meilleures
+# combinaisons d'hyperparamètres pour l'algorithme XGBoost.
+
+tuneGrid <- invisible(expand.grid(
+  nrounds = c(50),  # Nombre d'itérations
+  max_depth = c(4),   # Profondeur maximale de l'arbre
+  min_child_weight = c(1), # Poids minimum de l'enfant
+  subsample = c(0.8), # Sous-échantillonnage des observations
+  colsample_bytree = c(0.7),  # Sous-échantillonnage des colonnes lors de la création de chaque arbre
+  eta = c(0.1), # Taux d'apprentissage (learning rate)
+  gamma = c(0)  # Réduction minimale de la perte requise pour faire une scission supplémentaire sur une feuille
+))
+
+# Configuration du contrôle de la validation croisée
+trainControl <- invisible(trainControl(
+  method = "cv",  # Méthode de validation croisée
+  number = 10,  # Nombre de plis pour la validation croisée
+  classProbs = TRUE,  # Indiquer si les probabilités de classe doivent être calculées (important pour le calcul de l'AUC)
+  verboseIter = FALSE, # Indicateur de sortie verbose pour l'itération
+  allowParallel = TRUE  # Autoriser l'exécution parallèle pour la validation croisée si possible
+))
+
+
+# Entraîner un modèle XGBoost en utilisant la fonction train
+xgbGrid <- invisible(train(
+  x = as.matrix(X_train_split),    # Données d'entraînement
+  y = Y_train_split,                # Variable cible
+  trControl = trainControl,         # Contrôle de la validation croisée
+  tuneGrid = tuneGrid,              # Grille d'hyperparamètres à rechercher
+  method = "xgbTree",               # Méthode d'apprentissage : arbre XGBoost
+  verbosity = 1                     # Niveau de verbosité du processus d'entraînement
+))
+
+# Afficher les meilleurs hyperparamètres
+print(xgbGrid$bestTune)
+# # Créer des listes vides pour enregistrer les journaux d'évaluation et les listes de surveillance
+eval_log <- list()
+watchlist <- list(train = dtrain_split, test = dtest_split)
+```
+
+#### Entraînement du modèle
+
+```{r xgboostmodèlee, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# Entraînement du modèle avec les meilleurs hyperparamètres trouvés
+# scale_pos_weight=3.3 a été calculé comme le ratio des sinistres (target=1) et non sistres (target=0)
+final_model <- xgb.train(
+  params = list(
+    eta = xgbGrid$bestTune$eta,
+    max_depth = xgbGrid$bestTune$max_depth,
+    min_child_weight = xgbGrid$bestTune$min_child_weight,
+    subsample = xgbGrid$bestTune$subsample,
+    colsample_bytree = xgbGrid$bestTune$colsample_bytree,
+    gamma = xgbGrid$bestTune$gamma,
+    objective = "binary:logistic", # Objectif de classification binaire
+    eval_metric="auc",  # Métrique d'évaluation : AUC
+    scale_pos_weight=3.3 # Poids de classe positif pour l'équilibrage des classes
+  ),
+  data = dtrain_split,  # Données d'entraînement
+  nrounds = 100, # Nombre d'itérations
+  verbosity = 0, # Niveau de verbosité
+  watchlist = watchlist,   # Listes de surveillance
+  callbacks = list(cb.evaluation.log()) # Rappels pour le journal d'évaluation
+)
+
+# Historique de l'évaluation
+eval_history <- final_model$evaluation_log
+
+# Extraction des valeurs AUC pour les ensembles d'entraînement et de test
+train_auc <- eval_history$train_auc
+test_auc <- eval_history$test_auc
+
+# Création du dataframe pour le tracé
+auc_data <- data.frame(
+  round = 1:length(train_auc),
+  train_auc = train_auc,
+  test_auc = test_auc
+)
+
+# Création du tracé
+ggplot(auc_data, aes(x = round)) +
+  geom_line(aes(y = train_auc, colour = "Train AUC")) +
+  geom_line(aes(y = test_auc, colour = "Test AUC")) +
+  labs(x = "Itération", y = "AUC") +
+  ggtitle("Évolution de l'AUC pendant l'entraînement du XGBoost") +
+  scale_colour_manual(values = c("Train AUC" = "blue", "Test AUC" = "red")) +
+  theme_minimal()
+
+# Création de la matrice de données pour le test
+dtest <- xgb.DMatrix(data = as.matrix(X_test_enriched))
+
+# Faire des prédictions sur l'ensemble de test
+predictions <- predict(final_model, dtest)
+
+# Créer un data frame des prédictions
+predictions_df <- data.frame(Identifiant = X_test$Identifiant, target = predictions)
+
+# Ajouter une colonne d'index commençant à 0
+predictions_df$Index <- 0:(nrow(predictions_df) - 1)
+
+# Réorganiser les colonnes dans l'ordre souhaité
+predictions_df <- predictions_df[, c("Index", "Identifiant", "target")]
+
+# Enregistrer au format CSV, sans les noms de lignes et sans guillemets
+write.csv(predictions_df, "prediction_xgboost.csv", row.names = FALSE, quote = FALSE)
+          
+```
+
+
+#### Matrice d'importance
+```{r matriceimportance, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# Création de la matrice de données pour le test
+dtest <- xgb.DMatrix(data = as.matrix(X_test_split))
+predictions2 <- predict(final_model, dtest)
+
+# Matrice d'importance
+importance_matrix <- xgb.importance(model = final_model)
+xgb.plot.importance(importance_matrix)
+
+```
+
+#### Graphique de l'arbre 
+```{r finXGBoost, echo=FALSE, message=FALSE, warning=FALSE,eval=TRUE}
+xgb.plot.tree(model = final_model, trees = 0:1)  # Visualiser les deux premiers arbres
+```
+
+
+
+**Étape 4: Évaluation des performances**
+
+
+Pour évaluer les performances de notre modèle, nous avons calculé l'AUC (Area Under the Curve) et le coefficient de Gini normalisé.
+
+```{r évalXGBoost, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE}
+# Calcul de l'AUC
+auc_value <- roc(response = Y_test_split, predictor = predictions2)$auc
+
+print(paste("AUC:", auc_value))
+
+# Calcul du coefficient de Gini normalisé
+gini_normalized <- 2 * auc_value - 1
+
+# Affichage du coefficient de Gini
+print(paste("Le score Gini pour le modèle XGBoost :", gini_normalized))
+
+
+```
+
+**Étape 5: Prédiction sur l'ensemble de test**
+
+Nous avons complété notre analyse en effectuant des prédictions sur l'ensemble de test. Cette étape finale utilise le modèle final pour prédire les probabilités que chaque bâtiment dans l'ensemble de test dépose une réclamation d'assurance.
+
+Nous avons préparé un fichier de soumission comprenant les probabilités estimées de sinistre pour chaque bâtiment. La soumission de ce fichier sur le site du Data Challenge ENS a permis de convertir nos prédictions en un score de 0,3960.
+
+**Conclusion**
+
+L'approche XGBoost a démontré son efficacité par rapport au modèle précédent de l'arbre de décision, avec un score AUC nettement amélioré de 0.7176, ce qui reflète une meilleure capacité à différencier les bâtiments susceptibles de soumettre une réclamation d'assurance. Le score Gini normalisé a doublé à 0.4352, indiquant que le modèle XGBoost est nettement plus discriminant que le modèle basé sur un seul arbre de classification.
+
+Les améliorations apportées par XGBoost résident dans sa capacité à combiner les prédictions de multiples arbres de décision, permettant ainsi de capturer des nuances plus complexes au sein des données. L'interprétation des variables importantes et la visualisation des arbres contribuent à une compréhension transparente des facteurs influençant les prédictions. En outre, le modèle a été validé à travers un processus rigoureux de validation croisée, renforçant notre confiance dans sa capacité à généraliser au-delà de l'ensemble d'entraînement.
+
+
+
+Dans le cadre de notre étude avec le modèle XGBoost un aspect crucial a été l'optimisation des hyperparamètres. Ici, pour des raisons computationnelles, notre grille de recherche (tuneGrid) a été intentionnellement simplifiée, ne contenant qu'une seule valeur pour chaque paramètre. Cette approche visait à réduire la charge et le temps de calcul nécessaires pour trouver une configuration performante. Avec cette configuration de base, nous avons atteint un score de 0,4328 sur le site de l'ENS, un résultat prometteur compte tenu de la simplicité du modèle.
+
+Cependant, conscients du potentiel de l'optimisation pour améliorer davantage les performances, nous avons élargi notre grille de recherche. Le grid search était défini comme suit :
+
+tuneGrid <- expand.grid(
+  nrounds = c(50,100,150),
+  max_depth = c(4,8,16,32),
+  min_child_weight = c(1),
+  subsample = c(0.8),
+  colsample_bytree = c(0.7),
+  eta = c(0.1,0.01,0.001),
+  gamma = c(0)
+)
+
+Cette approche plus exhaustive permet de tester une variété plus large de combinaisons, donnant au modèle la possibilité d'explorer divers scénarios de complexité et d'adaptabilité. En utilisant ce grid search élargi, nous avons pu améliorer le score de précision sur le site de l'ENS à 0,4400. 
+
+Alors que nous progressons vers l'implémentation de LightGBM (Light Gradient Boosting Machine), nous nous attendons à explorer d'autres façons d'optimiser la performance. LightGBM est connu pour sa rapidité et son efficacité sur les grands ensembles de données et sa capacité à gérer les variables catégorielles de manière native. Ces caractéristiques pourraient s'avérer avantageuses dans notre contexte, étant donné la nature de nos données et l'objectif de prédiction.
+
+Dans les prochaines étapes, nous adapterons nos données aux spécifications de LightGBM et affinerons la configuration de notre modèle pour exploiter pleinement ses capacités. Nous évaluerons ensuite la performance du modèle LightGBM avec l'espoir d'améliorer encore les résultats obtenus avec XGBoost.
+
+### 3. LGMBoost ###
+
+```{r dataLGMBoost, echo=FALSE, message=FALSE, warning=FALSE,eval=TRUE}
+X_test <- read_csv("X_test.csv") %>% select(-`...1`)
+X_train <- read_csv("X_train.csv") %>% select(-`...1`)
+Y_train <- read_csv("y_train_saegPGl.csv")$target
+to_predict <- read_csv("X_test.csv") %>% select(-`...1`)
+
+data <- cbind(X_train, Y_train)
+
+# Créer des indices pour la division train-test
+set.seed(123)  # Fixation de la graine aléatoire
+splitIndices <- createDataPartition(data$Y_train, p = 0.8, list = FALSE)
+
+# Diviser les données en ensembles d'entraînement et de test
+data_train <- data[splitIndices, ]
+data_test <- data[-splitIndices, ]
+
+# Extraire X_train, Y_train, X_test et Y_test des données divisées
+X_train <- data_train[, -ncol(data_train)]  # Supprimer la dernière colonne (cible) pour les caractéristiques d'entraînement
+Y_train <- data_train[, ncol(data_train)]  # Extraire la dernière colonne (cible) pour la cible d'entraînement
+X_test <- data_test[, -ncol(data_test)]  # Supprimer la dernière colonne (cible) pour les caractéristiques de test
+Y_test <- data_test[, ncol(data_test)]  # Extraire la dernière colonne (cible) pour la cible de test
+
+# URL vers le fichier CSV contenant les données de correspondance entre le code INSEE et le code postal
+# Renommer la colonne "#Code_commune_INSEE" en "Insee" pour plus de clarté
+# Supprimer les lignes dupliquées basées sur la colonne "Insee" tout en conservant toutes les autres colonnes (.keep_all = TRUE)
+url_csv <- "https://www.data.gouv.fr/fr/datasets/r/edcfd5d7-5c97-4e86-8d27-e21c7e30a721"
+correspondance_df <- read_csv2(url_csv, locale = locale(encoding = "ISO-8859-1")) %>%
+  rename(Insee = `#Code_commune_INSEE`) %>%
+  distinct(Insee, .keep_all = TRUE)
+
+# Enrichissement de X_train et X_test et to_predict avec les données de correspondance en utilisant le code INSEE comme clé de jointure
+X_train_enriched <- left_join(X_train, correspondance_df, by = "Insee")
+X_test_enriched <- left_join(X_test, correspondance_df, by = "Insee")
+to_predict <- left_join(to_predict, correspondance_df, by = "Insee")
+
+# URL vers le fichier ZIP contenant les données CATNAT sur les inondations 
+url_zip <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbReco_Inondation.zip"
+
+# Création d'un fichier temporaire avec l'extension .zip pour stocker les données téléchargées
+destfile_zip <- tempfile(fileext = ".zip")
+
+# Téléchargement du fichier ZIP à partir de l'URL spécifiée et stockage dans le fichier temporaire créé
+download.file(url_zip, destfile_zip)
+
+# Décompression du fichier ZIP téléchargé dans le répertoire temporaire
+# exdir = tempdir() spécifie le répertoire dans lequel extraire les fichiers ZIP
+unzip(destfile_zip, exdir = tempdir())
+
+# Chemin d'accès vers le fichier Excel extrait dans le répertoire temporaire
+path_excel <- file.path(tempdir(), "ONRN_nbRecos_Inon_8222.xlsx")
+
+nombre_inondations <- read_excel(path_excel, sheet = 2) %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` = 
+           if_else(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` == "Pas de reconnaissance", 
+                   "0", 
+                   `Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`)) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\n inondation (tous types)\r\n(Somme : coulée de boue, remontée de nappe, submersion marine)`))
+
+# Enrichissement de X_train et X_test et to_predict avec les données CATNAT sur le nombre d'innondations
+# en utilisant le code INSEE comme clé de jointure
+X_train_enriched <- left_join(X_train_enriched, nombre_inondations, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_inondations, by = "Insee")
+to_predict <- left_join(to_predict, nombre_inondations, by = "Insee")
+
+# URL vers le fichier ZIP contenant les données CATNAT sur les mouvements de terrain
+url_zip_mvt <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbReco_Mvt.zip"
+destfile_zip_mvt <- tempfile(fileext = ".zip")
+download.file(url_zip_mvt, destfile_zip_mvt)
+unzip(destfile_zip_mvt, exdir = tempdir())
+
+path_excel_mvt <- file.path(tempdir(), "ONRN_nbRecos_Mvt_8222.xlsx")
+nombre_mouvements <- read_excel(path_excel_mvt, sheet = 2)
+
+nombre_mouvements <- nombre_mouvements %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nmouvement de terrain` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nmouvement de terrain`))
+
+# Enrichissement de X_train et X_test et to_predict avec les données CATNAT sur le nombre de mouvement de terrain
+# en utilisant le code INSEE comme clé de jointure
+X_train_enriched <- left_join(X_train_enriched, nombre_mouvements, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_mouvements, by = "Insee")
+to_predict <- left_join(to_predict, nombre_mouvements, by = "Insee")
+
+# URL vers le fichier ZIP contenant les données CATNAT sur les sécheresses
+url_zip_secheresse <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbRecos_Sech.zip"
+destfile_zip_secheresse <- tempfile(fileext = ".zip")
+download.file(url_zip_secheresse, destfile_zip_secheresse)
+unzip(destfile_zip_secheresse, exdir = tempdir())
+
+path_excel_secheresse <- file.path(tempdir(), "ONRN_nbRecos_Sech_8222.xlsx")
+nombre_secheresse <- read_excel(path_excel_secheresse, sheet = 2)
+
+nombre_secheresse <- nombre_secheresse %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nsécheresse` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nsécheresse`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nsécheresse` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nsécheresse`))
+
+# Enrichissement de X_train et X_test et to_predict avec les données CATNAT sur le nombre de sécheresse
+# en utilisant le code INSEE comme clé de jointure
+X_train_enriched <- left_join(X_train_enriched, nombre_secheresse, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_secheresse, by = "Insee")
+to_predict <- left_join(to_predict, nombre_secheresse, by = "Insee")
+
+# URL vers le fichier ZIP contenant les données CATNAT sur les séismes
+url_zip_séisme <- "https://files.georisques.fr/onrn/sinistralite/ONRN_nbRecos_Seisme.zip"
+destfile_zip_séisme <- tempfile(fileext = ".zip")
+download.file(url_zip_séisme, destfile_zip_séisme)
+unzip(destfile_zip_séisme, exdir = tempdir())
+
+path_excel_séisme <- file.path(tempdir(), "ONRN_nbRecos_Seisme_8222.xlsx")
+nombre_séisme <- read_excel(path_excel_séisme, sheet = 2)
+
+nombre_séisme <- nombre_séisme %>%
+  rename(Insee = `Code INSEE`) %>%
+  mutate(`Nombre de reconnaissances Cat Nat\r\nséisme` = 
+           na_if(`Nombre de reconnaissances Cat Nat\r\nséisme`, "Pas de reconnaissance"),
+         `Nombre de reconnaissances Cat Nat\r\nséisme` = 
+           as.numeric(`Nombre de reconnaissances Cat Nat\r\nséisme`))
+
+# Enrichissement de X_train et X_test et to_predict avec les données CATNAT sur le nombre de séisme
+# en utilisant le code INSEE comme clé de jointure
+X_train_enriched <- left_join(X_train_enriched, nombre_séisme, by = "Insee")
+X_test_enriched <- left_join(X_test_enriched, nombre_séisme, by = "Insee")
+to_predict <- left_join(to_predict, nombre_séisme, by = "Insee")
+
+# Créer une nouvelle colonne "Numéro Départements" en extrayant les deux premiers chiffres des codes postaux
+X_train_enriched$Numéro_Départements <- substr(X_train_enriched$Code_postal, 1, 2)
+
+# Créer une nouvelle colonne "Numéro Départements" en extrayant les deux premiers chiffres des codes postaux
+X_test_enriched$Numéro_Départements <- substr(X_test_enriched$Code_postal, 1, 2)
+
+to_predict$Numéro_Départements <- substr(to_predict$Code_postal, 1, 2)
+
+# URL du fichier Excel contenant les données sur le taux de cambriolage
+url_cambriolage <- "https://www.insee.fr/fr/statistiques/fichier/5039869/FET2021-12.xlsx"
+
+# Créer un chemin temporaire pour le fichier téléchargé
+invisible(temp_file <- tempfile(fileext = ".xlsx"))
+
+# Télécharger le fichier
+invisible(httr::GET(url_cambriolage, httr::write_disk(temp_file)))
+
+# Lire le fichier Excel téléchargé
+taux_cambriolage <- read_excel(temp_file, sheet = 1)
+
+# Calculer le nombre total de lignes à conserver
+n <- nrow(taux_cambriolage) - 4  # Soustrait 4 pour les quatre dernières lignes
+
+# Supprimer la première et les quatre dernières lignes
+taux_cambriolage <- taux_cambriolage[2:n, ]  # Commence à 2 pour sauter la première ligne
+
+# Sélectionne et renomme les colonnes
+taux_cambriolage <- taux_cambriolage %>%
+  select(Numéro_Départements = 1, `Taux_de_Cambriolage` = 3)
+
+# Joindre taux_cambriolage avec X_train_enriched et X_test_enriched
+X_train_enriched <- left_join(X_train_enriched, taux_cambriolage, by = "Numéro_Départements")
+X_test_enriched <- left_join(X_test_enriched, taux_cambriolage, by = "Numéro_Départements")
+to_predict <- left_join(to_predict, taux_cambriolage, by = "Numéro_Départements")
+
+# Exclure les colonnes spécifiques de X_train_enriched et X_test_enriched
+cols_to_exclude <- c("Libellé_d_acheminement", "Insee", "Nom_de_la_commune", 
+                     "Code_postal", "Ligne_5", "Commune.x", "Commune.x.x", 
+                     "Commune.y", "Commune.y.y", "Numéro_Départements")
+
+# Utiliser select() avec le signe "-" pour exclure les colonnes
+X_train_enriched <- X_train_enriched %>% select(-all_of(cols_to_exclude))
+X_test_enriched <- X_test_enriched %>% select(-all_of(cols_to_exclude))
+to_predict <- to_predict %>% select(-all_of(cols_to_exclude))
+
+X_train_enriched$EXPO <- gsub(",", ".", X_train_enriched$EXPO)
+X_test_enriched$EXPO <- gsub(",", ".", X_test_enriched$EXPO)
+
+# Convertir EXPO en numérique
+X_train_enriched$EXPO <- as.numeric(X_train_enriched$EXPO)
+X_test_enriched$EXPO <- as.numeric(X_test_enriched$EXPO)
+
+
+# Imputation avec la médiane pour les colonnes numériques
+numeric_cols <- sapply(X_train_enriched, is.numeric)
+X_train_enriched[numeric_cols] <- lapply(X_train_enriched[numeric_cols], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+X_test_enriched[numeric_cols] <- lapply(X_test_enriched[numeric_cols], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+
+# Vérification des valeurs manquantes
+invisible(colSums(is.na(X_train_enriched)))
+invisible(colSums(is.na(X_train_enriched)))
+
+# Remplacer les virgules par des points si nécessaire et supprimer tout caractère non numérique
+taux_cambriolage$`Taux_de_Cambriolage` <- gsub(",", ".", taux_cambriolage$`Taux_de_Cambriolage`)
+taux_cambriolage$`Taux_de_Cambriolage` <- as.numeric(gsub("[^0-9.]", "", taux_cambriolage$`Taux_de_Cambriolage`))
+
+# Calcul de la médiane ou de la moyenne pour les taux de cambriolage
+median_cambriolage <- median(taux_cambriolage$`Taux_de_Cambriolage`, na.rm = TRUE)
+
+# Imputation des valeurs NA
+X_train_enriched$`Taux_de_Cambriolage`[is.na(X_train_enriched$`Taux_de_Cambriolage`)] <- median_cambriolage
+X_test_enriched$`Taux_de_Cambriolage`[is.na(X_test_enriched$`Taux_de_Cambriolage`)] <- median_cambriolage
+
+# Fonction pour nettoyer les noms de colonnes
+# garantit que les noms de colonnes sont uniques et conformes aux conventions de nommage en R
+clean_colnames <- function(df) {
+  colnames(df) <- make.names(colnames(df), unique = TRUE)
+  return(df)
+}
+
+# Appliquer la fonction de nettoyage aux DataFrames
+X_train_enriched <- clean_colnames(X_train_enriched)
+X_test_enriched <- clean_colnames(X_test_enriched)
+to_predict <- clean_colnames(to_predict)
+
+```
+
+**Étape 1 : Préparation des données**
+
+Nous avons préparé nos jeux de données pour l'entraînement et le test en les convertissant en matrices et en traitant les variables catégorielles, puisque LightGBM gère nativement les caractéristiques catégorielles.
+
+Pour les colonnes numériques, nous avons imputé les valeurs manquantes par la médiane garantissant ainsi que nos modèles ne soient pas biaisés ou affectés par des erreurs dues à des valeurs manquantes.
+
+**Étape 2 : Configuration du modèle LightGBM**
+
+Nous avons défini les paramètres de LightGBM en choisissant un objectif binaire, puisque nous effectuons une classification. Nous avons opté pour une optimisation basée sur l'AUC avec des paramètres tels que le nombre de feuilles, le taux d'apprentissage et le nombre d'estimateurs, entre autres, pour contrôler la complexité du modèle et éviter le sur-ajustement.
+
+**Étape 3 : Entraînement du modèle et évaluation**
+
+En utilisant les données d’entraînement, nous avons entraîné le modèle avec 800 cycles de boosting, tout en évaluant les performances à la fois sur l'ensemble d'entraînement et de test pour surveiller l'évolution de l'AUC. Cette approche nous a permis de détecter et d'éviter le sur-ajustement.
+
+```{r LGMBoost, echo=FALSE, message=FALSE, warning=FALSE,eval=TRUE}
+# Créer un jeu de données LightGBM
+# Transforme les DataFrames en jeux de données LightGBM pour l'entraînement du modèle
+# Préparation des données test 
+X_test_prepared <- data.frame(lapply(X_test_enriched, function(x) if(is.factor(x)) as.integer(x) else x))
+test_data1 <- as.matrix(X_test_prepared)
+
+# Création d'un jeu de données LightGBM (train_data) et précision des variables catégorielles
+train_data <- lgb.Dataset(data = as.matrix(X_train_enriched), label = Y_train, categorical_feature = c("ft_4_categ", "ft_5_categ", "ft_6_categ", "ft_7_categ", "ft_8_categ", "ft_9_categ", "ft_10_categ", "ft_11_categ", "ft_12_categ", "ft_13_categ", "ft_14_categ", "ft_15_categ", "ft_16_categ", "ft_17_categ", "ft_18_categ", "ft_19_categ", "ft_21_categ", "ft_22_categ", "ft_23_categ", "ft_24_categ"))
+
+# Création d'un jeu de données de test (test_data) pour l'évaluation
+test_data <- lgb.Dataset(data = as.matrix(X_test_prepared), label = Y_test)
+
+# Définition des paramètres pour le modèle LightGBM
+params <- list(
+  objective = "binary", # Défini l'objectif du modèle comme une classification binaire
+  metric = "auc", # Utilise l'aire sous la courbe ROC (AUC) pour évaluer la performance du modèle
+  num_leaves = 31, # Nombre maximal de feuilles dans un arbre. Plus il y a de feuilles, plus le modèle est complexe.
+  learning_rate = 0.01, # Taux d'apprentissage pour faire des mises à jour de modèle. Des valeurs plus petites nécessitent plus d'arbres mais peuvent conduire à une meilleure performance.
+  n_estimators = 200, # Nombre d'arbres à construire
+  max_depth = -1, # Profondeur maximale des arbres. Une valeur de -1 signifie qu'il n'y a pas de limite de profondeur.
+  feature_fraction = 0.8, # Fraction des caractéristiques à utiliser à chaque division pour construire un arbre. Cela ajoute du hasard et améliore la généralisation.
+  bagging_fraction = 0.8, # Fraction des données à utiliser à chaque itération de boosting. C'est une forme de bagging (Bootstrap Aggregating)
+  bagging_freq = 5, # Fréquence du bagging. Exécute le bagging tous les 5 cycles de boosting.
+  verbose = 1, # Niveau de verbosité des logs pendant l'entraînement. 1 indique une sortie minimale pour chaque cycle.
+  max_bin = 255, # Nombre maximal de bacs que les caractéristiques numériques seront divisées en.
+  cat_smooth = 20, # Lissage appliqué aux caractéristiques catégoriques pour éviter le surajustement lors de cardinalités très faibles.
+  lambda_l2 = 0.5, # Terme de régularisation L2 sur les poids pour éviter le surajustement.
+  min_split_gain = 0.01, # Gain minimal nécessaire pour faire une nouvelle division d'un nœud de l'arbre.
+  min_child_weight = 1 # Somme minimale des poids d'observation requise dans un enfant. Utilisé pour contrôler le surajustement.
+)
+
+# Définition des jeux de données pour la validation
+valids <- list(
+  train = train_data, # Jeu de données d'entraînement pour l'apprentissage du modèle
+  test = test_data  # Jeu de données de test pour évaluer la performance du modèle
+)
+
+# Entraîner un modèle LightGBM avec les paramètres spécifiés
+lgb_model <- lgb.train(
+  params = params, # Paramètres du modèle spécifiés précédemment
+  data = train_data, # Données d'entraînement préparées pour LightGBM
+  nrounds = 800, # Nombre total de cycles de boosting à exécuter. Plus il y a de cycles, plus le modèle peut apprendre, mais risque de surajuster.
+  valids = valids, # Dictionnaire contenant les jeux de données de validation pour suivre la performance du modèle pendant l'entraînement
+  verbose = 1 # Contrôle la quantité d'informations à imprimer. Ici, '1' indique que des informations seront imprimées à chaque itération.
+)
+
+# Extraction des résultats de l'évaluation
+evals <- lgb_model$record_evals
+
+# Prédictions des valeurs avec le modèle LightGBM
+predictions <- predict(lgb_model, test_data1)
+library(pROC)
+roc_result <- roc(Y_test, predictions)
+```
+
+```{r LGMBoostAUC, echo=FALSE, message=FALSE, warning=FALSE,eval=TRUE}
+# Afficher directement l'AUC à partir de l'objet ROC.
+auc_value <- roc_result$auc
+
+# Imprimer l'AUC
+print(paste("AUC:", auc_value))
+
+# Calculer le coefficient de Gini basé sur l'AUC
+gini_coefficient <- 2 * auc_value - 1
+print(paste("Le score Gini pour le modèle LGMBoost :", gini_coefficient))
+
+to_predict_prepared <- data.frame(lapply(to_predict, function(x) if(is.factor(x)) as.integer(x) else x))
+
+# Préparer les données `to_predict` pour la prédiction
+to_predict_matrix <- as.matrix(to_predict_prepared)  # Convertir le dataframe préparé en matrice pour la compatibilité avec LightGBM
+
+# Utiliser le modèle LightGBM entraîné pour faire des prédictions sur `to_predict`
+predictions_to_predict <- predict(lgb_model, to_predict_matrix) # Générer des prédictions en utilisant le modèle LightGBM
+
+# Créer un dataframe pour la soumission
+submission_df <- data.frame(Identifiant = to_predict$Identifiant, target = predictions_to_predict)  # Créer un dataframe avec les identifiants et les prédictions
+
+# Créer une colonne d'index qui commence à 0
+submission_df$Index <- seq(0, nrow(submission_df) - 1)
+
+# Réorganiser les colonnes pour mettre l'index en première position
+submission_df <- submission_df[, c("Index", "Identifiant", "target")] 
+
+# Sauvegarder le fichier CSV, sans les noms des lignes et sans guillemets
+write.csv(submission_df, "LGBM_prediction.csv", row.names = FALSE, quote = FALSE)  
+```
+
+**Étape 5 : Application des prédictions**
+
+Enfin, nous avons préparé un autre jeu de données (to_predict) pour la prédiction, en suivant la même procédure de prétraitement que pour les données de test. Nous avons ensuite utilisé notre modèle pour prédire les probabilités de sinistre pour ces données, ce qui peut être utilisé pour des décisions ultérieures dans le processus d'assurance.
+
+Nous avons préparé un fichier de soumission comprenant les probabilités estimées de sinistre pour chaque bâtiment. La soumission de ce fichier sur le site du Data Challenge ENS a permis de convertir nos prédictions en un score de 0,3958.
+
+**Conclusion**
+
+Le modèle LGMBoost a montré des performances prometteuses avec une AUC de 0.7280, surpassant légèrement les résultats de l'approche XGBoost. Le score Gini, reflétant cette amélioration, atteint 0.4560, signifiant que notre modèle LGMBoost a réussi à mieux classer les bâtiments à risque par rapport aux modèles précédents.
+
+La progression à travers les différentes méthodes de boosting a illustré comment l'ajustement fin des hyperparamètres, l'attention portée à l'équilibrage du modèle et l'évaluation rigoureuse de la performance peuvent aboutir à des améliorations significatives. La préparation minutieuse des données, l'optimisation des paramètres, et l'entraînement vigilant avec suivi des mesures de performance ont été des étapes clés pour atteindre une prédiction plus précise.
+
+### Conclusion
+
+Au terme de notre étude dans le cadre du Data Challenge ENS sur l’assurance des bâtiments, notre analyse détaillée a permis de mettre en évidence la performance de différents modèles prédictifs, en mettant l'accent sur l’utilisation d’XGBoost et de LightGBM. Bien que chaque modèle ait offert des insights précieux, c'est finalement le modèle XGBoost qui a été retenu pour sa capacité supérieure à généraliser, comme en témoigne le score plus élevé obtenu sur le site du challenge ENS. Cette décision s'appuie sur la robustesse et la finesse des prédictions du modèle XGBoost, qui a su tirer parti des nuances complexes des données.
+
+Dans notre modèle XGBoost, les caractéristiques comme la superficie du bâtiment `superficief`, le temps assuré `EXPO`, l'année de construction estimée `ft_22_categ`, le taux de cambriolage `Taux_de_Cambriolage`et le nombre d'inondations `Nombre_d_innondations` sont révélées être les plus discriminantes. Cela suggère logiquement que des facteurs comme la taille du bâtiment, son âge, la fréquence des sinistres locaux et la criminalité environnante sont cruciaux dans l’évaluation des risques de sinistre. Ces éléments reflètent les impacts directs et indirects sur la probabilité de réclamations, mettant en lumière la complexité de la tarification et de la gestion des risques dans l'assurance non-vie.
+
+Le processus de modélisation a été exigeant mais extrêmement enrichissant. Nous avons approfondi notre compréhension des algorithmes avancés comme XGBoost et LightGBM, ce qui a nécessité une documentation approfondie et une curiosité technique constante. L'aspect le plus marquant et instructif de notre travail a été le traitement des données. L'ajustement précis des hyperparamètres et la manipulation adéquate des variables ont considérablement amélioré la précision de nos prédictions. Ce soin dans la préparation des données a renforcé notre modèle, permettant une interprétation plus claire et une prédiction plus fiable.
+
+L'incorporation de données externes s'est avérée plus compliquée que prévu. La recherche et l'intégration de données pertinentes sur des éléments tels que les catastrophes naturelles et la criminalité locale ont présenté des défis significatifs, notamment en termes de fiabilité et de compatibilité des données. Cela a souligné l'importance d'une approche rigoureuse dans la sélection et le traitement des informations externes.
+
+Pour des améliorations futures, enrichir notre modèle avec un éventail plus large de données externes pourrait être bénéfique. L'intégration de données supplémentaires sur des facteurs environnementaux et socio-économiques pourrait permettre une évaluation encore plus précise des risques. Cela pourrait également aider à mieux capturer les dynamiques locales qui influencent la fréquence et la sévérité des sinistres.
